@@ -1,0 +1,503 @@
+import os
+import re
+import json
+import time
+import queue
+import wave
+import torch
+import threading
+import tempfile
+import concurrent.futures
+import subprocess  # <-- FIXED: missing import
+from pathlib import Path
+from pydub import AudioSegment
+from pydub.playback import _play_with_simpleaudio
+from pydub.silence import detect_nonsilent
+import numpy as np
+import pvporcupine
+import pyaudio
+import sounddevice as sd
+import requests
+from faster_whisper import WhisperModel
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from langdetect import detect
+
+# === CONFIGURATION ===
+
+FAST_MODE = False  # Set to True for ultra-fast testing mode
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[Buddy] Running on device: {device}")
+
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+PIPER_EXE = "C:/Piper/piper.exe"
+CHIME_PATH = "C:/BuddyAssets/chime.wav"
+LANGUAGE_MODEL_MAP = {
+    "pl": "C:/Piper/models/pl_PL-gosia-medium.onnx",
+    "en": "C:/Piper/models/en_US-amy-medium.onnx",
+    "it": "C:/Piper/models/it_IT-paola-medium.onnx"
+}
+
+known_users_path = "known_users.json"
+if os.path.exists(known_users_path):
+    with open(known_users_path, "r", encoding="utf-8") as f:
+        known_users = json.load(f)
+else:
+    known_users = {}
+
+THEMES_PATH = "themes_memory"
+os.makedirs(THEMES_PATH, exist_ok=True)
+
+# === TONE & PERSONALITY PROMPT ===
+
+def build_personality_prompt(tone):
+    personality_map = {
+        "friendly": "You're a warm and witty assistant named Buddy. You respond with a friendly, conversational tone, often adding light humor or personal touches.",
+        "professional": "You're a concise and professional assistant named Buddy. You provide clear, accurate answers with a respectful tone.",
+        "neutral": "You're a helpful assistant named Buddy. You respond naturally and clearly in a neutral tone."
+    }
+    personality_desc = personality_map.get(tone, personality_map["neutral"])
+    return f"""{personality_desc}
+Always answer like you're talking to a real person. Avoid robotic phrasing.
+Keep responses engaging. If the user sounds confused or emotional, show empathy.
+Your responses can use short interjections like 'Hmm', 'I see', 'Got it!', 'Great question!'.
+"""
+
+# === AUDIO PLAYBACK QUEUES & THREADS ===
+
+tts_queue = queue.Queue()
+playback_queue = queue.Queue()
+current_playback = None
+
+def stop_playback():
+    global current_playback
+    if current_playback and hasattr(current_playback, "is_playing") and current_playback.is_playing():
+        current_playback.stop()
+        current_playback = None
+    # Drain playback queue
+    while not playback_queue.empty():
+        try:
+            playback_queue.get_nowait()
+            playback_queue.task_done()
+        except queue.Empty:
+            break
+
+def audio_playback_worker():
+    global current_playback
+    while True:
+        audio = playback_queue.get()
+        if audio is None:
+            break
+        try:
+            current_playback = _play_with_simpleaudio(audio)
+            current_playback.wait_done()
+        except Exception as e:
+            print(f"[Buddy] Audio playback error: {e}")
+        finally:
+            current_playback = None
+            playback_queue.task_done()
+
+def tts_playback_worker():
+    while True:
+        item = tts_queue.get()
+        if item is None:
+            break
+        if isinstance(item, tuple):
+            text, lang = item
+        else:
+            text, lang = item, "pl"
+        try:
+            generate_and_play_tts(text, lang)
+        except Exception as e:
+            print(f"[Buddy] TTS playback error: {e}")
+        tts_queue.task_done()
+
+threading.Thread(target=audio_playback_worker, daemon=True).start()
+threading.Thread(target=tts_playback_worker, daemon=True).start()
+
+# === PIPER TTS ===
+
+def generate_and_play_tts(text, lang="pl"):
+    if not text.strip():
+        return
+    model_path = LANGUAGE_MODEL_MAP.get(lang, LANGUAGE_MODEL_MAP["pl"])
+    output_path = f"response_{int(time.time())}.wav"
+    try:
+        command = [PIPER_EXE, "--model", model_path, "--output_file", output_path]
+        subprocess.run(command, input=text.encode('utf-8'), check=True)
+        audio = AudioSegment.from_wav(output_path)
+        playback_queue.put(audio)
+    except Exception as e:
+        print(f"[Buddy] TTS Error: {e}")
+    finally:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+
+def speak_async(text, lang="pl"):
+    return executor.submit(generate_and_play_tts, text, lang)
+
+def play_chime():
+    try:
+        audio = AudioSegment.from_wav(CHIME_PATH)
+        playback_queue.put(audio)
+    except Exception as e:
+        print(f"[Buddy] Error playing chime: {e}")
+
+# === USER MEMORY & THEMATIC MEMORY ===
+
+def save_known_users():
+    with open(known_users_path, "w", encoding="utf-8") as f:
+        json.dump(known_users, f, indent=2, ensure_ascii=False)
+
+def load_user_history(name):
+    path = f"history_{name}.json"
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_user_history(name, history):
+    path = f"history_{name}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(history[-20:], f, ensure_ascii=False, indent=2)
+
+def extract_topic_from_text(text):
+    words = re.findall(r'\b\w+\b', text.lower())
+    freq = {}
+    for w in words:
+        if len(w) < 4:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    if freq:
+        return max(freq, key=freq.get)
+    return None
+
+def update_thematic_memory(user, utterance):
+    topic = extract_topic_from_text(utterance)
+    if not topic:
+        return
+    theme_path = os.path.join(THEMES_PATH, f"{user}_themes.json")
+    if os.path.exists(theme_path):
+        with open(theme_path, "r", encoding="utf-8") as f:
+            themes = json.load(f)
+    else:
+        themes = {}
+    themes[topic] = themes.get(topic, 0) + 1
+    with open(theme_path, "w", encoding="utf-8") as f:
+        json.dump(themes, f, ensure_ascii=False, indent=2)
+
+def get_frequent_topics(user, top_n=3):
+    theme_path = os.path.join(THEMES_PATH, f"{user}_themes.json")
+    if not os.path.exists(theme_path):
+        return []
+    with open(theme_path, "r", encoding="utf-8") as f:
+        themes = json.load(f)
+    sorted_themes = sorted(themes.items(), key=lambda x: x[1], reverse=True)
+    return [topic for topic, _ in sorted_themes[:top_n]]
+
+# === AUDIO INPUT, TRIMMING, VAD, STT ===
+
+whisper_small = WhisperModel("small", device=device, compute_type="float16")
+try:
+    whisper_large = WhisperModel("large-v3", device="cpu", compute_type="int8")
+except Exception as e:
+    print("[Buddy] Failed to load Whisper large-v3:", e)
+    whisper_large = None
+
+def trim_silence(filepath):
+    try:
+        sound = AudioSegment.from_wav(filepath)
+        nonsilent_ranges = detect_nonsilent(sound, min_silence_len=200, silence_thresh=-45)
+        if nonsilent_ranges:
+            start, end = nonsilent_ranges[0][0], nonsilent_ranges[-1][1]
+            trimmed = sound[start:end]
+            trimmed.export(filepath, format="wav")
+    except Exception as e:
+        print(f"[Buddy] Silence trim error: {e}")
+
+def record_audio(filename="input.wav", max_duration=10, aggressiveness=2):
+    import webrtcvad
+    import collections
+
+    vad = webrtcvad.Vad(aggressiveness)
+    sample_rate = 16000
+    frame_duration = 30  # ms
+    frame_size = int(sample_rate * frame_duration / 1000)
+    num_padding_frames = int(300 / frame_duration)
+    ring_buffer = collections.deque(maxlen=num_padding_frames)
+    triggered = False
+    voiced_frames = []
+
+    print("[Buddy] Listening (VAD)...")
+    stream = sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16')
+    with stream:
+        for _ in range(0, int(sample_rate / frame_size * max_duration)):
+            frame, _ = stream.read(frame_size)
+            frame_bytes = frame.tobytes()
+            is_speech = vad.is_speech(frame_bytes, sample_rate)
+
+            if not triggered:
+                ring_buffer.append((frame_bytes, is_speech))
+                num_voiced = len([f for f, speech in ring_buffer if speech])
+                if num_voiced > 0.9 * ring_buffer.maxlen:
+                    triggered = True
+                    for f, s in ring_buffer:
+                        voiced_frames.append(f)
+                    ring_buffer.clear()
+            else:
+                voiced_frames.append(frame_bytes)
+                ring_buffer.append((frame_bytes, is_speech))
+                num_unvoiced = len([f for f, speech in ring_buffer if not speech])
+                if num_unvoiced > 0.9 * ring_buffer.maxlen:
+                    break
+    print(f"[Buddy] Saved: {filename}")
+    with wave.open(filename, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b''.join(voiced_frames))
+
+    # Trim silence for faster STT
+    trim_silence(filename)
+
+def detect_language(text, fallback="pl"):
+    try:
+        detected = detect(text)
+        if detected in ["en", "pl", "it"]:
+            return detected
+    except:
+        pass
+    return fallback
+
+def transcribe_audio(filename="input.wav"):
+    print("[Buddy] Transcribing... (small)")
+    try:
+        segments, info = whisper_small.transcribe(filename, language=None, beam_size=5)
+        text = "".join(segment.text for segment in segments).strip()
+        if len(text) < 4 and whisper_large is not None:
+            print("[Buddy] Fallback to large-v3...")
+            segments, info = whisper_large.transcribe(filename, language=None, beam_size=5)
+            text = "".join(segment.text for segment in segments).strip()
+        print(f"[Buddy] Understood: {text}")
+    except Exception as e:
+        print(f"[Buddy] STT error: {e}")
+        return "", "pl"
+    play_chime()
+    time.sleep(0.3)
+    lang_code = detect_language(text, fallback=info.language)
+    return text, lang_code
+
+# === USER RECOGNITION ===
+
+def generate_embedding(audio_file):
+    text, _ = transcribe_audio(audio_file)
+    return embedding_model.encode([text])[0]
+
+def match_known_user(new_embedding, threshold=0.75):
+    best_name, best_score = None, 0
+    for name, emb in known_users.items():
+        sim = cosine_similarity([new_embedding], [emb])[0][0]
+        if sim > best_score:
+            best_name, best_score = name, sim
+    return (best_name, best_score) if best_score >= threshold else (None, best_score)
+
+def identify_or_register_user():
+    if FAST_MODE:
+        return "Guest"
+    embedding = generate_embedding("input.wav")
+    name, score = match_known_user(embedding)
+    if name:
+        print(f"[Buddy] Recognized: {name} ({score:.2f})")
+        return name
+    # Multilingual registration prompt
+    tts_queue.put(("Cześć! Jak masz na imię?", "pl"))
+    tts_queue.put(("Hi! What's your name?", "en"))
+    tts_queue.put(("Ciao! Come ti chiami?", "it"))
+    record_audio("name.wav", 3)
+    name_text, _ = transcribe_audio("name.wav")
+    name = name_text.strip().title() or f"User{int(time.time())}"
+    known_users[name] = embedding.tolist()
+    save_known_users()
+    generate_and_play_tts(f"Miło Cię poznać, {name}!", lang="pl")
+    return name
+
+# === THEMATIC MEMORY + DYNAMIC REPLY LOGIC ===
+
+def decide_reply_length(question, conversation_mode="auto"):
+    short_triggers = ["what time", "who", "quick", "fast", "short", "how many", "when"]
+    long_triggers = ["explain", "describe", "details", "why", "history", "story"]
+    q = question.lower()
+    if conversation_mode == "fast":
+        return "short"
+    if conversation_mode == "long":
+        return "long"
+    if any(t in q for t in short_triggers):
+        return "short"
+    if any(t in q for t in long_triggers):
+        return "long"
+    return "long" if len(q.split()) > 8 else "short"
+
+def build_llama_system_prompt(name, tone_style, history, question, lang, topics, reply_length):
+    system_prompt = build_personality_prompt(tone_style)
+    if topics:
+        system_prompt += f"\nYou remember these user interests/topics: {', '.join(topics)}.\n"
+    system_prompt += (
+        "\nConversation history:\n" +
+        "\n".join([f"User: {t['user']}\nBuddy: {t['buddy']}" for t in history[-5:]]) +
+        f"\nUser: {question}\nBuddy:"
+    )
+    if reply_length == "short":
+        system_prompt += "\nPlease answer concisely, in 1-2 sentences."
+    elif reply_length == "long":
+        system_prompt += "\nFeel free to give a detailed answer."
+    return system_prompt
+
+def ask_llama3_streaming(question, name, history, lang="pl", conversation_mode="auto"):
+    update_thematic_memory(name, question)
+    topics = get_frequent_topics(name, top_n=3)
+
+    user_tones = {
+        "Dawid": "friendly",
+        "Anna": "professional",
+        "Guest": "neutral"
+    }
+    tone_style = user_tones.get(name, "neutral")
+
+    reply_length = decide_reply_length(question, conversation_mode)
+    system_prompt = build_llama_system_prompt(
+        name, tone_style, history, question, lang, topics, reply_length
+    )
+
+    chunk_text = ""
+    full_text = ""
+    try:
+        with requests.post("http://localhost:11434/api/generate",
+                           json={"model": "llama3", "prompt": system_prompt, "stream": True},
+                           stream=True) as r:
+            for line in r.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line.decode("utf-8"))
+                        text_chunk = chunk.get("response", "")
+                        if not text_chunk.strip():
+                            continue
+                        print(text_chunk, end="", flush=True)
+                        chunk_text += text_chunk
+                        full_text += text_chunk
+                        # SHORT reply: speak only the first chunk/sentence, then break
+                        if reply_length == "short":
+                            if '.' in chunk_text or len(chunk_text) > 50:
+                                tts_queue.put((chunk_text.strip(), lang))
+                                break
+                        # LONG reply: stream and speak at every punctuation
+                        else:
+                            if any(p in chunk_text for p in [".", "!", "?", ","]) and len(chunk_text.strip()) > 8:
+                                tts_queue.put((chunk_text.strip(), lang))
+                                chunk_text = ""
+                    except Exception as e:
+                        print("[Buddy] LLM streaming error:", e)
+    except Exception as e:
+        print("[Buddy] LLM HTTP error:", e)
+    print()
+    history.append({"user": question, "buddy": full_text})
+    if not FAST_MODE:
+        save_user_history(name, history)
+
+# === SESSION & CONVERSATION LOGIC ===
+
+def should_end_conversation(text):
+    endings = [
+        "dziękuj", "to wszystko", "bye", "ciao", "finito", "grazie",
+        "that's all", "merci", "thank you", "thanks"
+    ]
+    text = text.strip().lower()
+    if any(text == phrase for phrase in endings):
+        return True
+    if len(text.split()) <= 3 and any(phrase in text for phrase in endings):
+        return True
+    return False
+
+def handle_user_interaction(speaker, history, conversation_mode="auto"):
+    record_audio()
+    play_chime()
+    question, lang = transcribe_audio()
+    if not question:
+        return True
+    INTERRUPT_PHRASES = ["stop", "buddy stop", "przerwij", "cancel"]
+    if any(phrase in question.lower() for phrase in INTERRUPT_PHRASES):
+        print("[Buddy] Received interrupt command.")
+        stop_playback()
+        return True
+    if should_end_conversation(question):
+        print("[Buddy] Ending conversation as requested.")
+        return False
+    ask_llama3_streaming(question, speaker, history, lang, conversation_mode)
+    return True
+
+def main():
+    access_key = "/PLJ88d4+jDeVO4zaLFaXNkr6XLgxuG7dh+6JcraqLhWQlk3AjMy9Q=="
+    keyword_paths = [r"C:\Users\drzew\Documents\Buddyassistant\hey-buddy_en_windows_v3_0_0.ppn"]
+    porcupine = pvporcupine.create(access_key=access_key, keyword_paths=keyword_paths)
+    pa = pyaudio.PyAudio()
+    stream = pa.open(rate=porcupine.sample_rate, channels=1, format=pyaudio.paInt16,
+                     input=True, frames_per_buffer=porcupine.frame_length)
+
+    print("[Buddy] Waiting for wake word 'Hey Buddy'...")
+    in_session, session_timeout = False, 45
+    speaker = None
+    history = []
+    last_time = 0
+
+    try:
+        while True:
+            if not in_session:
+                pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
+                pcm = np.frombuffer(pcm, dtype=np.int16)
+                if porcupine.process(pcm) >= 0:
+                    print("[Buddy] Wake word detected!")
+                    stop_playback()
+                    generate_and_play_tts("Hi", "en")
+                    playback_queue.join()
+                    record_audio()
+                    play_chime()
+                    speaker = identify_or_register_user()
+                    history = load_user_history(speaker)
+                    in_session = handle_user_interaction(speaker, history)
+                    last_time = time.time()
+            else:
+                if time.time() - last_time > session_timeout:
+                    print("[Buddy] Session expired.")
+                    in_session = False
+                    continue
+                print("[Buddy] Listening for next question...")
+                stop_playback()
+                playback_queue.join()
+                in_session = handle_user_interaction(speaker, history)
+                last_time = time.time()
+
+    except KeyboardInterrupt:
+        print("[Buddy] Interrupted by user.")
+    finally:
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+        try:
+            porcupine.delete()
+        except Exception:
+            pass
+        executor.shutdown(wait=True)
+
+if __name__ == "__main__":
+    main()
