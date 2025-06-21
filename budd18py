@@ -471,14 +471,13 @@ def tts_worker():
         except Exception as e:
             print(f"[TTS WORKER EXCEPTION] {e}")
 
-threading.Thread(target=tts_worker, daemon=True).start()
-
 from pydub import AudioSegment
 
 from pydub.playback import _play_with_simpleaudio
 
 from pydub.playback import _play_with_simpleaudio
 
+import traceback
 import numpy as np
 import sounddevice as sd
 
@@ -499,7 +498,7 @@ def audio_playback_worker():
             # Expect tuple: (samples, sample_rate)
             audio_np, sample_rate = item
 
-            # Print stats for debugging
+            # ***** ADD THESE PRINTS HERE *****
             print(f"[Buddy][Playback] audio_np shape: {audio_np.shape}, dtype: {audio_np.dtype}, max: {np.max(audio_np)}, min: {np.min(audio_np)}")
 
             # Convert to stereo if mono (Windows soundcards may require this)
@@ -512,8 +511,14 @@ def audio_playback_worker():
                 audio_np = audio_np.astype(np.int16)
                 print("[Buddy][Playback] Converted dtype to int16.")
 
+            # ***** ADD THIS PRINT BEFORE PLAYBACK *****
+            print("[Buddy][Playback] Calling sd.play()")
+
             sd.play(audio_np, samplerate=sample_rate, device=SPEAKER_DEVICE_INDEX)
             sd.wait()
+
+            # ***** ADD THIS PRINT AFTER PLAYBACK *****
+            print("[Buddy][Playback] sd.play() complete")
 
             buddy_talking.clear()
             playback_queue.task_done()
@@ -521,9 +526,8 @@ def audio_playback_worker():
 
         except Exception as e:
             print(f"[Buddy][Playback ERROR]: {e}")
+            traceback.print_exc()
             buddy_talking.clear()
-
-threading.Thread(target=audio_playback_worker, daemon=True).start()
 
 def speak_async(text, lang=DEFAULT_LANG, style=None):
     print(f"[Buddy] speak_async queued: {repr(text)} lang={lang}")
