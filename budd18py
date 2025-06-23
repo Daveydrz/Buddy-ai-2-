@@ -9,7 +9,7 @@ import tempfile
 import concurrent.futures
 from pathlib import Path
 from pydub import AudioSegment
-from pydub.playback import _play_with_simpleaudio as play
+from pydub.playbook import _play_with_simpleaudio as play
 import numpy as np
 import pvporcupine
 import pyaudio
@@ -24,24 +24,47 @@ from sklearn.metrics.pairwise import cosine_similarity
 from scipy.io.wavfile import write
 from kokoro_onnx import Kokoro
 import soundfile as sf
-from scipy.signal import resample, resample_poly
+from scipy.signal import resample, resample_poly, butter, sosfilt, hilbert
+from scipy.ndimage import uniform_filter1d
 import random
+import io
+import wave
+import simpleaudio as sa
+import traceback
+import array
 from textblob import TextBlob
-from webrtc_audio_processing import AudioProcessingModule
 from io import BytesIO
 import difflib
 from resemblyzer import VoiceEncoder
-encoder = VoiceEncoder()
 
+# Enhanced audio processing with better AEC
+from webrtc_audio_processing import AudioProcessingModule
+
+encoder = VoiceEncoder()
 last_tts_audio = None  # Global buffer to track Buddy's last spoken waveform
 last_flavor = None 
 
-# ========== CONFIG & PATHS ==========
+# ========== ENHANCED AUDIO PROCESSING CONFIG ==========
 WEBRTC_SAMPLE_RATE = 16000
-WEBRTC_FRAME_SIZE = 160
+WEBRTC_FRAME_SIZE = 160  # 10ms frames for optimal WebRTC processing
 WEBRTC_CHANNELS = 1
 MIC_DEVICE_INDEX = 60
 MIC_SAMPLE_RATE = 48000
+SPEAKER_DEVICE_INDEX = 12
+
+# Enhanced AEC settings
+AEC_DELAY_MS = 50  # Typical speaker-to-mic delay
+AEC_FILTER_LENGTH = 512  # Longer filter for better echo cancellation
+NOISE_GATE_THRESHOLD = -40  # dB threshold for noise gate
+AGC_TARGET_LEVEL = -20  # dB target for automatic gain control
+
+# VAD and interruption settings
+VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive
+MIN_SPEECH_DURATION = 0.3  # seconds
+SILENCE_TIMEOUT = 1.5  # seconds
+BARGE_IN_DELAY = 0.8  # seconds to wait before allowing interruption
+
+# ========== CONFIG & PATHS ==========
 CHIME_PATH = "chime.wav"
 known_users_path = "known_users.json"
 THEMES_PATH = "themes_memory"
@@ -62,47 +85,310 @@ BUDDY_BELIEFS_PATH = "buddy_beliefs.json"
 LONG_TERM_MEMORY_PATH = "buddy_long_term_memory.json"
 PERSONALITY_TRAITS_PATH = "buddy_personality_traits.json"
 DYNAMIC_KNOWLEDGE_PATH = "buddy_dynamic_knowledge.json"
-ref_audio_buffer = np.zeros(WEBRTC_SAMPLE_RATE * 2, dtype=np.int16)  # 2 seconds
-ref_audio_lock = threading.Lock()
+BYPASS_AEC = False
+
+# ========== ENHANCED AUDIO PROCESSING MODULE ==========
+class EnhancedAudioProcessor:
+    def __init__(self):
+        self.aec_module = AudioProcessingModule()
+        self.setup_aec()
+        
+        # Circular buffers for reference audio (speaker output)
+        self.ref_buffer_size = int(WEBRTC_SAMPLE_RATE * 2)  # 2 seconds buffer
+        self.ref_buffer = np.zeros(self.ref_buffer_size, dtype=np.float32)
+        self.ref_write_pos = 0
+        self.ref_lock = threading.RLock()
+        
+        # Adaptive filters
+        self.adaptive_filter = np.zeros(AEC_FILTER_LENGTH, dtype=np.float32)
+        self.filter_update_rate = 0.01
+        
+        # Noise estimation
+        self.noise_floor = np.ones(513) * 1e-6  # For 1024 FFT
+        self.noise_alpha = 0.95
+        
+        # AGC state
+        self.agc_gain = 1.0
+        self.agc_alpha = 0.999
+        
+        # VAD enhancement
+        self.vad_history = []
+        self.speech_prob_threshold = 0.6
+        
+    def setup_aec(self):
+        """Configure WebRTC audio processing with optimal settings"""
+        self.aec_module.set_stream_format(WEBRTC_SAMPLE_RATE, WEBRTC_CHANNELS)
+        
+        # Echo cancellation settings
+        self.aec_module.set_aec_level(2)  # High quality AEC
+        self.aec_module.set_delay_agnostic_aec(True)  # Handle variable delays
+        
+        # Noise suppression
+        self.aec_module.set_ns_level(2)  # High noise suppression
+        
+        # Automatic gain control
+        self.aec_module.set_agc_level(2)  # Adaptive gain
+        self.aec_module.set_agc_target_level(AGC_TARGET_LEVEL)
+        
+        # VAD configuration
+        self.aec_module.set_vad_level(2)  # Medium VAD sensitivity
+        
+        # High-pass filter to remove low-frequency noise
+        self.aec_module.set_highpass_filter(True)
+        
+    def add_reference_audio(self, audio_data):
+        """Add speaker output to reference buffer for echo cancellation"""
+        if isinstance(audio_data, bytes):
+            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            audio_np = audio_data.astype(np.float32)
+            if audio_np.dtype == np.int16:
+                audio_np = audio_np / 32768.0
+        
+        with self.ref_lock:
+            # Add to circular buffer
+            samples_to_add = len(audio_np)
+            if samples_to_add > self.ref_buffer_size:
+                audio_np = audio_np[-self.ref_buffer_size:]
+                samples_to_add = self.ref_buffer_size
+            
+            # Handle wrap-around
+            end_pos = self.ref_write_pos + samples_to_add
+            if end_pos <= self.ref_buffer_size:
+                self.ref_buffer[self.ref_write_pos:end_pos] = audio_np
+            else:
+                # Split write
+                first_part = self.ref_buffer_size - self.ref_write_pos
+                self.ref_buffer[self.ref_write_pos:] = audio_np[:first_part]
+                self.ref_buffer[:end_pos - self.ref_buffer_size] = audio_np[first_part:]
+            
+            self.ref_write_pos = end_pos % self.ref_buffer_size
+    
+    def get_reference_audio(self, num_samples):
+        """Get recent reference audio for echo cancellation"""
+        with self.ref_lock:
+            if num_samples > self.ref_buffer_size:
+                num_samples = self.ref_buffer_size
+            
+            start_pos = (self.ref_write_pos - num_samples) % self.ref_buffer_size
+            
+            if start_pos + num_samples <= self.ref_buffer_size:
+                return self.ref_buffer[start_pos:start_pos + num_samples].copy()
+            else:
+                # Handle wrap-around
+                first_part = self.ref_buffer_size - start_pos
+                result = np.zeros(num_samples, dtype=np.float32)
+                result[:first_part] = self.ref_buffer[start_pos:]
+                result[first_part:] = self.ref_buffer[:num_samples - first_part]
+                return result
+    
+    def spectral_subtraction(self, audio_fft, noise_floor):
+        """Apply spectral subtraction for noise reduction"""
+        magnitude = np.abs(audio_fft)
+        phase = np.angle(audio_fft)
+        
+        # Calculate noise reduction factor
+        snr = magnitude / (noise_floor + 1e-10)
+        reduction_factor = np.maximum(0.1, 1.0 - (2.0 / (snr + 1e-10)))
+        
+        # Apply reduction
+        cleaned_magnitude = magnitude * reduction_factor
+        return cleaned_magnitude * np.exp(1j * phase)
+    
+    def adaptive_noise_estimation(self, audio_fft, is_speech):
+        """Update noise floor estimation"""
+        magnitude = np.abs(audio_fft)
+        
+        if not is_speech:
+            # Update noise floor during non-speech segments
+            self.noise_floor = (self.noise_alpha * self.noise_floor + 
+                              (1 - self.noise_alpha) * magnitude)
+    
+    def apply_agc(self, audio):
+        """Apply automatic gain control"""
+        # Calculate RMS level
+        rms = np.sqrt(np.mean(audio ** 2))
+        
+        if rms > 1e-6:  # Avoid division by zero
+            target_rms = 10 ** (AGC_TARGET_LEVEL / 20.0)
+            desired_gain = target_rms / rms
+            
+            # Smooth gain changes
+            self.agc_gain = (self.agc_alpha * self.agc_gain + 
+                           (1 - self.agc_alpha) * desired_gain)
+            
+            # Limit gain to prevent distortion
+            self.agc_gain = np.clip(self.agc_gain, 0.1, 10.0)
+            
+            return audio * self.agc_gain
+        
+        return audio
+    
+    def enhanced_vad(self, audio_chunk):
+        """Enhanced VAD with temporal smoothing"""
+        # Convert to int16 for WebRTC VAD
+        if audio_chunk.dtype != np.int16:
+            audio_int16 = (audio_chunk * 32767).astype(np.int16)
+        else:
+            audio_int16 = audio_chunk
+        
+        # WebRTC VAD
+        vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        is_speech = vad.is_speech(audio_int16.tobytes(), WEBRTC_SAMPLE_RATE)
+        
+        # Add to history for temporal smoothing
+        self.vad_history.append(1.0 if is_speech else 0.0)
+        if len(self.vad_history) > 10:  # Keep last 10 frames (100ms)
+            self.vad_history.pop(0)
+        
+        # Smooth decision
+        speech_probability = np.mean(self.vad_history)
+        return speech_probability > self.speech_prob_threshold
+    
+    def process_microphone_audio(self, mic_audio):
+        """Main processing pipeline for microphone audio"""
+        try:
+            # Convert input to float32
+            if isinstance(mic_audio, bytes):
+                audio = np.frombuffer(mic_audio, dtype=np.int16).astype(np.float32) / 32768.0
+            else:
+                audio = mic_audio.astype(np.float32)
+                if audio.dtype == np.int16:
+                    audio = audio / 32768.0
+            
+            # Ensure correct length for WebRTC processing
+            if len(audio) != WEBRTC_FRAME_SIZE:
+                if len(audio) > WEBRTC_FRAME_SIZE:
+                    audio = audio[:WEBRTC_FRAME_SIZE]
+                else:
+                    audio = np.pad(audio, (0, WEBRTC_FRAME_SIZE - len(audio)), 'constant')
+            
+            # Get reference audio for echo cancellation
+            ref_audio = self.get_reference_audio(WEBRTC_FRAME_SIZE)
+            
+            # Convert to int16 for WebRTC processing
+            mic_int16 = (audio * 32767).astype(np.int16)
+            ref_int16 = (ref_audio * 32767).astype(np.int16)
+            
+            # Apply reference audio to AEC
+            if np.any(ref_int16):
+                self.aec_module.process_reverse_stream(ref_int16.tobytes())
+            
+            # Process microphone stream
+            processed_bytes = self.aec_module.process_stream(mic_int16.tobytes())
+            processed_audio = np.frombuffer(processed_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # Enhanced VAD
+            is_speech = self.enhanced_vad(processed_audio)
+            
+            # Spectral processing for additional noise reduction
+            if len(processed_audio) >= 512:  # Minimum for FFT
+                # Apply FFT
+                fft_audio = np.fft.rfft(processed_audio, n=1024)
+                
+                # Update noise estimation
+                self.adaptive_noise_estimation(fft_audio, is_speech)
+                
+                # Apply spectral subtraction
+                if not is_speech:
+                    fft_audio = self.spectral_subtraction(fft_audio, self.noise_floor)
+                
+                # Convert back to time domain
+                processed_audio = np.fft.irfft(fft_audio)[:len(processed_audio)]
+            
+            # Apply AGC
+            processed_audio = self.apply_agc(processed_audio)
+            
+            # Convert back to int16
+            output = (processed_audio * 32767).astype(np.int16)
+            
+            return output, is_speech
+            
+        except Exception as e:
+            print(f"[AEC] Error in process_microphone_audio: {e}")
+            # Return original audio on error
+            if isinstance(mic_audio, bytes):
+                return np.frombuffer(mic_audio, dtype=np.int16), False
+            return mic_audio.astype(np.int16), False
 
 # ========== GLOBAL STATE ==========
+audio_processor = EnhancedAudioProcessor()
 aec_module = AudioProcessingModule()
 aec_module.set_stream_format(WEBRTC_SAMPLE_RATE, WEBRTC_CHANNELS)
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
 os.makedirs(THEMES_PATH, exist_ok=True)
+
+# Legacy ref buffer for backward compatibility
+ref_audio_buffer = np.zeros(WEBRTC_SAMPLE_RATE * 2, dtype=np.int16)  # 2 seconds
 ref_audio_lock = threading.Lock()
+
+# Threading and queue management
+playback_lock = threading.Lock()
+tts_lock = threading.Lock()
 tts_queue = queue.Queue()
 playback_queue = queue.Queue()
 current_playback = None
 playback_stop_flag = threading.Event()
 buddy_talking = threading.Event()
 vad_triggered = threading.Event()
+full_duplex_interrupt_flag = threading.Event()
+full_duplex_vad_result = queue.Queue()
+
+# Memory and state
 LAST_FEW_BUDDY = []
 RECENT_WHISPER = []
 known_users = {}
 active_speakers = {}
 active_speaker_lock = threading.Lock()
-full_duplex_interrupt_flag = threading.Event()
-full_duplex_vad_result = queue.Queue()
-session_emotion_mode = {}
-tts_lock = threading.Lock()
-playback_lock = threading.Lock()
+session_emotion_mode = {}  # user: mood for mood injection
 tts_start_time = 0
-BYPASS_AEC = False  
 
+# Load existing data
 if os.path.exists(known_users_path):
     with open(known_users_path, "r", encoding="utf-8") as f:
         known_users = json.load(f)
+
 if DEBUG:
     device = "cuda" if 'cuda' in os.environ.get('CUDA_VISIBLE_DEVICES', '') or hasattr(np, "cuda") else "cpu"
     print(f"[Buddy] Running on device: {device}")
     print("Embedding model loaded", flush=True)
     print("Kokoro loaded", flush=True)
-    print("Main function entered!", flush=True)
+    print("Enhanced audio processor initialized", flush=True)
 
-# ========== AUDIO PROCESSING ==========
+# ========== AUDIO PROCESSING HELPERS ==========
+def downsample(audio, orig_sr, target_sr):
+    """Improved downsampling with anti-aliasing"""
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    
+    if audio.dtype == np.int16:
+        audio = audio.astype(np.float32) / 32768.0
+    
+    if orig_sr == target_sr:
+        return (audio * 32767).astype(np.int16)
+    
+    # Apply anti-aliasing filter before downsampling
+    nyquist_target = target_sr / 2
+    nyquist_orig = orig_sr / 2
+    
+    if nyquist_target < nyquist_orig:
+        # Design lowpass filter
+        sos = butter(5, nyquist_target / nyquist_orig, btype='low', output='sos')
+        audio = sosfilt(sos, audio)
+    
+    # Resample
+    gcd = np.gcd(orig_sr, target_sr)
+    up = target_sr // gcd
+    down = orig_sr // gcd
+    audio_resampled = resample_poly(audio, up, down)
+    
+    # Clip and convert
+    audio_resampled = np.clip(audio_resampled, -1.0, 1.0)
+    return (audio_resampled * 32767).astype(np.int16)
+
+# Legacy AEC function for backward compatibility
 def apply_aec(mic_audio, bypass_aec=False):
     try:
         if bypass_aec:
@@ -149,7 +435,6 @@ def apply_aec(mic_audio, bypass_aec=False):
         return mic_audio[:WEBRTC_FRAME_SIZE]
 
 from numpy.linalg import norm
-import numpy as np
 
 def is_echo_of_last_tts(mic_audio, last_tts_audio, threshold=0.9):
     if mic_audio.shape != last_tts_audio.shape:
@@ -160,7 +445,53 @@ def is_echo_of_last_tts(mic_audio, last_tts_audio, threshold=0.9):
     correlation = np.dot(mic_audio, last_tts_audio) / (norm(mic_audio) * norm(last_tts_audio) + 1e-6)
     return correlation > threshold
 
-# ========== BACKGROUND VAD LISTENER (FULL-DUPLEX) ==========
+# ========== ENHANCED BACKGROUND VAD LISTENER ==========
+def enhanced_background_vad_listener():
+    """Enhanced full-duplex VAD with better interruption handling"""
+    blocksize = int(MIC_SAMPLE_RATE * 0.02)  # 20ms blocks
+    min_bargein_delay = BARGE_IN_DELAY
+    speech_frames = 0
+    min_speech_frames = int(MIN_SPEECH_DURATION / 0.02)  # Convert to frame count
+    
+    print("[Buddy][FULL-DUPLEX] Enhanced VAD listener started")
+    
+    try:
+        with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=MIC_SAMPLE_RATE, 
+                          channels=1, dtype='int16', blocksize=blocksize) as stream:
+            
+            while buddy_talking.is_set():
+                frame, _ = stream.read(blocksize)
+                mic_audio = frame.flatten()
+                
+                # Downsample to WebRTC sample rate
+                mic_16k = downsample(mic_audio, MIC_SAMPLE_RATE, WEBRTC_SAMPLE_RATE)
+                
+                # Process audio through enhanced pipeline
+                processed_audio, is_speech = audio_processor.process_microphone_audio(mic_16k)
+                
+                # Avoid premature interruption
+                if time.time() - tts_start_time < min_bargein_delay:
+                    speech_frames = 0
+                    continue
+                
+                # Count consecutive speech frames
+                if is_speech:
+                    speech_frames += 1
+                else:
+                    speech_frames = max(0, speech_frames - 2)  # Decay faster
+                
+                # Trigger interruption if sufficient speech detected
+                if speech_frames >= min_speech_frames:
+                    print("[Buddy][FULL-DUPLEX] User interruption detected! Stopping playback.")
+                    full_duplex_interrupt_flag.set()
+                    full_duplex_vad_result.put(processed_audio)
+                    stop_playback()
+                    break
+                    
+    except Exception as e:
+        print(f"[Buddy][FULL-DUPLEX VAD Error]: {e}")
+
+# Legacy background VAD for backward compatibility
 def background_vad_listener():
     vad = webrtcvad.Vad(3)
     blocksize = int(MIC_SAMPLE_RATE * 0.02)
@@ -205,6 +536,13 @@ def background_vad_listener():
     except Exception as e:
         print(f"[Buddy][FULL-DUPLEX VAD Stream Error]: {e}")
 
+def start_background_vad_thread():
+    """Start the enhanced background VAD thread"""
+    full_duplex_interrupt_flag.clear()
+    thread = threading.Thread(target=enhanced_background_vad_listener, daemon=True)
+    thread.start()
+    return thread
+
 # ========== MULTI-SPEAKER DETECTION ==========
 def detect_active_speaker(audio_chunk):
     embedding = generate_embedding_from_audio(audio_chunk)
@@ -225,7 +563,6 @@ def generate_embedding_from_audio(audio_np):
         audio_np = audio_np[:, 0]  # ensure mono
 
     return encoder.embed_utterance(audio_np)
-
 
 def assign_turn_per_speaker(audio_chunk):
     name, score = detect_active_speaker(audio_chunk)
@@ -443,33 +780,323 @@ def whisper_confidence_low(text, avg_logprob, no_speech_prob):
         return True
     return False
 
-def start_background_vad_thread():
-    full_duplex_interrupt_flag.clear()
-    threading.Thread(target=background_vad_listener, daemon=True).start()
+# ========== ENHANCED VAD AND LISTEN ==========
+def enhanced_vad_and_listen():
+    """Enhanced VAD with better noise handling and interruption support"""
+    blocksize = int(MIC_SAMPLE_RATE * 0.02)  # 20ms blocks
+    min_speech_frames = int(MIN_SPEECH_DURATION / 0.02)
+    silence_frames = int(SILENCE_TIMEOUT / 0.02)
+    max_recording_time = 10.0  # Maximum recording time in seconds
 
-# ========== TTS & PLAYBACK ==========
+    with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=MIC_SAMPLE_RATE, 
+                       channels=1, blocksize=blocksize, dtype='int16') as stream:
+        
+        print("\n[Buddy] === Enhanced listening mode active ===")
+        audio_buffer = []
+        speech_frames = 0
+        silence_count = 0
+        recording = False
+        start_time = None
 
-def cancel_mic_audio(mic_chunk):
-    mic = np.frombuffer(mic_chunk, dtype=np.int16)
-    mic_16k = downsample(mic, MIC_SAMPLE_RATE, WEBRTC_SAMPLE_RATE)
-    return aec_module.process_stream(mic_16k[:WEBRTC_FRAME_SIZE].tobytes())
+        while True:
+            frame, _ = stream.read(blocksize)
+            mic_audio = frame.flatten()
+            
+            # Downsample for processing
+            mic_16k = downsample(mic_audio, MIC_SAMPLE_RATE, WEBRTC_SAMPLE_RATE)
+            
+            # Process through enhanced pipeline
+            processed_audio, is_speech = audio_processor.process_microphone_audio(mic_16k)
+            
+            if is_speech:
+                speech_frames += 1
+                silence_count = 0
+                
+                if not recording and speech_frames >= min_speech_frames:
+                    print("[Buddy] Speech detected. Starting recording...")
+                    recording = True
+                    start_time = time.time()
+                    audio_buffer = []
+                    
+                if recording:
+                    audio_buffer.append(processed_audio)
+                    
+            else:
+                if recording:
+                    silence_count += 1
+                    audio_buffer.append(processed_audio)
+                    
+                    # Check for end of speech
+                    if silence_count >= silence_frames:
+                        print("[Buddy] End of speech detected. Processing...")
+                        break
+                        
+                    # Check for timeout
+                    if time.time() - start_time > max_recording_time:
+                        print("[Buddy] Recording timeout. Processing...")
+                        break
+                else:
+                    speech_frames = max(0, speech_frames - 1)
 
-def downsample(audio, orig_sr, target_sr):
-    if audio.ndim > 1:
-        audio = audio[:, 0]  # ensure mono
-    if audio.dtype == np.int16:
-        audio = audio.astype(np.float32) / 32768.0
+        if audio_buffer:
+            # Concatenate all audio chunks
+            full_audio = np.concatenate(audio_buffer, axis=0)
+            print(f"[Buddy] Recorded {len(full_audio)} samples for processing")
+            return full_audio
+        else:
+            return np.array([], dtype=np.int16)
 
-    gcd = np.gcd(orig_sr, target_sr)
-    up = target_sr // gcd
-    down = orig_sr // gcd
+# Legacy VAD function
+def vad_and_listen():
+    vad = webrtcvad.Vad(3)  # Lower sensitivity to avoid background noise
+    blocksize = int(MIC_SAMPLE_RATE * 0.02)  # 960 samples for 20ms at 48kHz
+    min_speech_frames = 10
+    silence_thresh = 1.0
 
-    resampled = resample_poly(audio, up, down)
-    resampled = np.clip(resampled, -1.0, 1.0)
-    return (resampled * 32767).astype(np.int16)
+    with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=MIC_SAMPLE_RATE, channels=1, blocksize=blocksize, dtype='int16') as stream:
+        print("\n[Buddy] === SŁUCHAM, mów do mnie... ===")
+        frame_buffer = []
+        speech_detected = 0
+
+        while True:
+            frame, _ = stream.read(blocksize)
+            mic = np.frombuffer(frame.tobytes(), dtype=np.int16)
+            mic_16k = downsample(mic, MIC_SAMPLE_RATE, 16000)
+
+            for i in range(0, len(mic_16k), 160):
+                chunk = mic_16k[i:i+160]
+                if len(chunk) < 160:
+                    continue
+
+                with ref_audio_lock:
+                    aec_module.process_reverse_stream(ref_audio_buffer.tobytes())
+
+                processed = aec_module.process_stream(chunk.tobytes())
+                chunk_out = np.frombuffer(processed, dtype=np.int16)
+
+                # 🔇 Filter out quiet chunks (likely TV / Buddy's voice)
+                volume = np.abs(chunk_out).mean()
+                if volume < 700:
+                    continue
+
+                if vad.is_speech(chunk_out.tobytes(), 16000):
+                    frame_buffer.append(chunk_out)
+                    speech_detected += 1
+
+                    if speech_detected >= min_speech_frames:
+                        print("[Buddy] VAD: Wykryto mowę. Nagrywam...")
+                        audio = frame_buffer.copy()
+                        last_speech = time.time()
+                        start_time = time.time()
+                        frame_buffer.clear()
+
+                        while time.time() - last_speech < silence_thresh and (time.time() - start_time) < 8:
+                            frame, _ = stream.read(blocksize)
+                            mic = np.frombuffer(frame.tobytes(), dtype=np.int16)
+                            mic_16k = downsample(mic, MIC_SAMPLE_RATE, 16000)
+
+                            for j in range(0, len(mic_16k), 160):
+                                chunk2 = mic_16k[j:j+160]
+                                if len(chunk2) < 160:
+                                    continue
+
+                                with ref_audio_lock:
+                                    aec_module.process_reverse_stream(ref_audio_buffer.tobytes())
+
+                                processed2 = aec_module.process_stream(chunk2.tobytes())
+                                chunk_out2 = np.frombuffer(processed2, dtype=np.int16)
+
+                                # 🔇 Again filter quiet background
+                                if np.abs(chunk_out2).mean() < 300:
+                                    continue
+
+                                audio.append(chunk_out2)
+
+                                if vad.is_speech(chunk_out2.tobytes(), 16000):
+                                    last_speech = time.time()
+
+                        print("[Buddy] Koniec nagrania. Wysyłam do Whisper...")
+                        audio_np = np.concatenate(audio, axis=0).astype(np.int16)
+                        return audio_np
+                else:
+                    if len(frame_buffer) > 0:
+                        frame_buffer.clear()
+                    speech_detected = 0
+
+def enhanced_fast_listen_and_transcribe(history=None):
+    """Enhanced listening with better audio processing"""
+    wait_after_buddy_speaks(delay=0.3)
+    
+    # Check for interruption during TTS
+    if not full_duplex_vad_result.empty():
+        print("[Buddy] Using interrupted audio from full-duplex VAD")
+        interrupted_audio = full_duplex_vad_result.get()
+        # Continue recording for a bit more
+        additional_audio = enhanced_vad_and_listen()
+        if len(additional_audio) > 0:
+            audio = np.concatenate([interrupted_audio, additional_audio])
+        else:
+            audio = interrupted_audio
+    else:
+        audio = enhanced_vad_and_listen()
+    
+    if len(audio) == 0:
+        return "..."
+    
+    # Save for debugging
+    try:
+        write("temp_input.wav", WEBRTC_SAMPLE_RATE, audio)
+        print(f"[DEBUG] Saved enhanced audio: shape={audio.shape}, dtype={audio.dtype}")
+    except Exception as e:
+        print(f"[Buddy] Error saving audio: {e}")
+    
+    # Send to Whisper
+    text = stt_stream(audio).strip()
+    cleaned = re.sub(r'[^\w\s]', '', text.lower())
+
+    # ✅ Skip if nothing detected
+    if not text or len(cleaned) < 2:
+        print("[DEBUG] Empty or too short. Exiting interaction.")
+        return "..."
+
+    # ✅ Skip if it's a direct echo of Buddy's recent output
+    if is_echo(cleaned):
+        print(f"[Buddy] Skipping echo: {cleaned}")
+        return "..."
+
+    # ✅ Skip if it's a meaningless confirmation (loop trigger)
+    if is_useless_confirmation(cleaned):
+        print(f"[Buddy] Skipping useless confirmation: {text}")
+        return "..."
+
+    # ✅ Noise/gibberish filter
+    if is_noise_or_gibberish(text):
+        print(f"[Buddy] Skipping gibberish: {text}")
+        return "..."
+
+    # ✅ Prevent exact or near-duplicate user repeat
+    if history and "user" in history[-1]:
+        last_user = history[-1]["user"].strip().lower()
+        ratio = difflib.SequenceMatcher(None, last_user, cleaned).ratio()
+        if ratio > 0.95:
+            print(f"[Buddy] Skipping redundant user input (sim={ratio:.2f})")
+            return "..."
+
+    # ✅ Prevent reprocessing Buddy's most recent reply (text match)
+    if history and "buddy" in history[-1]:
+        last_reply = history[-1]["buddy"].strip().lower()
+        if cleaned in last_reply:
+            print(f"[Buddy] Detected echo of last Buddy message: {cleaned}")
+            return "..."
+
+    # ✅ Track for future echo prevention
+    if cleaned:
+        RECENT_WHISPER.append(cleaned)
+        if len(RECENT_WHISPER) > 5:
+            RECENT_WHISPER.pop(0)
+
+    return text
+
+def is_noise_or_gibberish(text):
+    if not text or len(text.strip()) == 0:
+        return True
+
+    cleaned = re.sub(r'[^\w\s]', '', text.strip().lower())
+    
+    # Reject short or meaningless utterances
+    if len(cleaned.split()) <= 1 and len(cleaned) < 6:
+        return True
+
+    # Reject if it matches recent Buddy lines (echo filter)
+    if cleaned in [x.lower().strip() for x in LAST_FEW_BUDDY[-3:]]:
+        print("[Buddy] Ignored echo of recent Buddy response.")
+        return True
+
+    # Reject background-like or filler speech
+    nonsense_keywords = ["hmm", "uh", "um", "err", "eh", "oh", "ah", "yeah", "mmm", "what", "huh"]
+    return any(word in cleaned for word in nonsense_keywords)
+
+def is_echo(text):
+    if not text or len(text.strip()) < 3:
+        return False
+
+    cleaned = re.sub(r'[^\w\s]', '', text.strip().lower())
+    if not cleaned or len(cleaned.split()) < 2:
+        return False
+
+    # Block known throwaway confirmations
+    if cleaned in {"okay", "sure", "cool", "nice", "awesome", "same here", "me too"}:
+        print(f"[Buddy] Skipping known confirmation echo: {cleaned}")
+        return True
+
+    for prev in LAST_FEW_BUDDY[-3:]:
+        prev_clean = re.sub(r'[^\w\s]', '', prev.strip().lower())
+
+        # Fuzzy match
+        ratio = difflib.SequenceMatcher(None, cleaned, prev_clean).ratio()
+        word_diff = abs(len(cleaned.split()) - len(prev_clean.split()))
+        if ratio > 0.87 and word_diff <= 4:
+            print(f"[Buddy] Skipping echo:\n→ new:  {cleaned}\n→ prev: {prev_clean}\n→ sim={ratio:.2f}, word_diff={word_diff}")
+            return True
+
+        # Partial containment
+        if cleaned in prev_clean:
+            print(f"[Buddy] Skipping partial echo match: {cleaned} in {prev_clean}")
+            return True
+
+    return False
+
+def is_useless_confirmation(text):
+    confirmations = [
+        "glad to hear it", "same here", "me too", "good to know",
+        "that's nice", "cool", "nice", "awesome", "sure", "okay", "alright",
+        "I'm glad to hear it", "I am glad to hear it", "same for me"
+    ]
+    text = text.strip().lower()
+    return any(text == c or text.startswith(c) for c in confirmations)
+
+def fast_listen_and_transcribe(history=None):
+    """Legacy function - choose between enhanced or legacy version"""
+    # Use enhanced version by default
+    return enhanced_fast_listen_and_transcribe(history)
+
+# ========== TTS & ENHANCED PLAYBACK ==========
+def generate_and_play_kokoro(text, lang):
+    """Generate TTS audio using Kokoro and queue for playback"""
+    global tts_start_time, last_tts_audio
+    tts_start_time = time.time()
+    
+    try:
+        voice = KOKORO_VOICES.get(lang, KOKORO_VOICES["en"])
+        kokoro_lang = KOKORO_LANGS.get(lang, KOKORO_LANGS["en"])
+        
+        print(f"[Buddy][TTS] Generating: '{text}' with voice={voice}, lang={kokoro_lang}")
+        
+        # Generate audio with Kokoro
+        samples, sample_rate = kokoro.create(text, voice=voice, lang=kokoro_lang, speed=1.0)
+        
+        # Store for echo detection
+        last_tts_audio = samples.copy()
+        
+        # Convert to AudioSegment for compatibility
+        audio_seg = AudioSegment(
+            samples.tobytes(), 
+            frame_rate=sample_rate, 
+            sample_width=samples.dtype.itemsize, 
+            channels=1
+        )
+        
+        print(f"[Buddy][TTS] Generated {len(samples)} samples at {sample_rate}Hz")
+        
+        # Queue for playback
+        playback_queue.put(audio_seg)
+        
+    except Exception as e:
+        print(f"[Buddy][TTS Error]: {e}")
+        traceback.print_exc()
 
 def tts_worker():
-    print("[Buddy][TTS_WORKER] Started")
+    print("[Buddy][TTS_WORKER] Enhanced TTS worker started")
     while True:
         try:
             item = tts_queue.get()
@@ -493,10 +1120,10 @@ def tts_worker():
             tts_queue.task_done()
         except Exception as e:
             print(f"[TTS WORKER EXCEPTION] {e}")
+            traceback.print_exc()
 
-from pydub import AudioSegment
-
-def audio_playback_worker():
+def enhanced_audio_playback_worker():
+    """Enhanced audio playback with reference audio capture"""
     global current_playback
 
     while True:
@@ -516,6 +1143,9 @@ def audio_playback_worker():
             samples_16k = resample_poly(samples, 16000, audio.frame_rate)
             samples_16k = np.clip(samples_16k, -1.0, 1.0)
             samples_16k_int16 = (samples_16k * 32767).astype(np.int16)
+
+            # Add to enhanced processor's reference buffer
+            audio_processor.add_reference_audio(samples_16k_int16)
 
             # ✅ Launch playback thread without blocking
             playback_thread = threading.Thread(
@@ -540,6 +1170,9 @@ def audio_playback_worker():
 
             playback_queue.task_done()
 
+# Legacy playback worker for backward compatibility
+def audio_playback_worker():
+    return enhanced_audio_playback_worker()
 
 def play_and_inject(audio_seg, samples_16k_int16):
     global current_playback
@@ -620,6 +1253,11 @@ def play_chime():
         if DEBUG:
             print(f"[Buddy] Error playing chime: {e}")
 
+def cancel_mic_audio(mic_chunk):
+    mic = np.frombuffer(mic_chunk, dtype=np.int16)
+    mic_16k = downsample(mic, MIC_SAMPLE_RATE, WEBRTC_SAMPLE_RATE)
+    return aec_module.process_stream(mic_16k[:WEBRTC_FRAME_SIZE].tobytes())
+
 def set_ref_audio(raw_bytes):
     try:
         # Convert bytes to int16 array
@@ -656,202 +1294,25 @@ def wait_after_buddy_speaks(delay=0.3):
         time.sleep(0.05)
     time.sleep(0.3)
 
-# ========== VAD + LISTEN ==========
-def vad_and_listen():
-    vad = webrtcvad.Vad(3)  # Lower sensitivity to avoid background noise
-    blocksize = int(MIC_SAMPLE_RATE * 0.02)  # 960 samples for 20ms at 48kHz
-    min_speech_frames = 10
-    silence_thresh = 1.0
-
-    with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=MIC_SAMPLE_RATE, channels=1, blocksize=blocksize, dtype='int16') as stream:
-        print("\n[Buddy] === SŁUCHAM, mów do mnie... ===")
-        frame_buffer = []
-        speech_detected = 0
-
-        while True:
-            frame, _ = stream.read(blocksize)
-            mic = np.frombuffer(frame.tobytes(), dtype=np.int16)
-            mic_16k = downsample(mic, MIC_SAMPLE_RATE, 16000)
-
-            for i in range(0, len(mic_16k), 160):
-                chunk = mic_16k[i:i+160]
-                if len(chunk) < 160:
-                    continue
-
-                with ref_audio_lock:
-                    aec_module.process_reverse_stream(ref_audio_buffer.tobytes())
-
-                processed = aec_module.process_stream(chunk.tobytes())
-                chunk_out = np.frombuffer(processed, dtype=np.int16)
-
-                # 🔇 Filter out quiet chunks (likely TV / Buddy's voice)
-                volume = np.abs(chunk_out).mean()
-                if volume < 700:
-                    continue
-
-                if vad.is_speech(chunk_out.tobytes(), 16000):
-                    frame_buffer.append(chunk_out)
-                    speech_detected += 1
-
-                    if speech_detected >= min_speech_frames:
-                        print("[Buddy] VAD: Wykryto mowę. Nagrywam...")
-                        audio = frame_buffer.copy()
-                        last_speech = time.time()
-                        start_time = time.time()
-                        frame_buffer.clear()
-
-                        while time.time() - last_speech < silence_thresh and (time.time() - start_time) < 8:
-                            frame, _ = stream.read(blocksize)
-                            mic = np.frombuffer(frame.tobytes(), dtype=np.int16)
-                            mic_16k = downsample(mic, MIC_SAMPLE_RATE, 16000)
-
-                            for j in range(0, len(mic_16k), 160):
-                                chunk2 = mic_16k[j:j+160]
-                                if len(chunk2) < 160:
-                                    continue
-
-                                with ref_audio_lock:
-                                    aec_module.process_reverse_stream(ref_audio_buffer.tobytes())
-
-                                processed2 = aec_module.process_stream(chunk2.tobytes())
-                                chunk_out2 = np.frombuffer(processed2, dtype=np.int16)
-
-                                # 🔇 Again filter quiet background
-                                if np.abs(chunk_out2).mean() < 300:
-                                    continue
-
-                                audio.append(chunk_out2)
-
-                                if vad.is_speech(chunk_out2.tobytes(), 16000):
-                                    last_speech = time.time()
-
-                        print("[Buddy] Koniec nagrania. Wysyłam do Whisper...")
-                        audio_np = np.concatenate(audio, axis=0).astype(np.int16)
-                        return audio_np
-                else:
-                    if len(frame_buffer) > 0:
-                        frame_buffer.clear()
-                    speech_detected = 0
-
-def is_noise_or_gibberish(text):
-    if not text or len(text.strip()) == 0:
-        return True
-
-    cleaned = re.sub(r'[^\w\s]', '', text.strip().lower())
-    
-    # Reject short or meaningless utterances
-    if len(cleaned.split()) <= 1 and len(cleaned) < 6:
-        return True
-
-    # Reject if it matches recent Buddy lines (echo filter)
-    if cleaned in [x.lower().strip() for x in LAST_FEW_BUDDY[-3:]]:
-        print("[Buddy] Ignored echo of recent Buddy response.")
-        return True
-
-    # Reject background-like or filler speech
-    nonsense_keywords = ["hmm", "uh", "um", "err", "eh", "oh", "ah", "yeah", "mmm", "what", "huh"]
-    return any(word in cleaned for word in nonsense_keywords)
-
-import difflib
-import re
-
-def is_echo(text):
-    if not text or len(text.strip()) < 3:
-        return False
-
-    cleaned = re.sub(r'[^\w\s]', '', text.strip().lower())
-    if not cleaned or len(cleaned.split()) < 2:
-        return False
-
-    # Block known throwaway confirmations
-    if cleaned in {"okay", "sure", "cool", "nice", "awesome", "same here", "me too"}:
-        print(f"[Buddy] Skipping known confirmation echo: {cleaned}")
-        return True
-
-    for prev in LAST_FEW_BUDDY[-3:]:
-        prev_clean = re.sub(r'[^\w\s]', '', prev.strip().lower())
-
-        # Fuzzy match
-        ratio = difflib.SequenceMatcher(None, cleaned, prev_clean).ratio()
-        word_diff = abs(len(cleaned.split()) - len(prev_clean.split()))
-        if ratio > 0.87 and word_diff <= 4:
-            print(f"[Buddy] Skipping echo:\n→ new:  {cleaned}\n→ prev: {prev_clean}\n→ sim={ratio:.2f}, word_diff={word_diff}")
-            return True
-
-        # Partial containment
-        if cleaned in prev_clean:
-            print(f"[Buddy] Skipping partial echo match: {cleaned} in {prev_clean}")
-            return True
-
-    return False
-
-def is_useless_confirmation(text):
-    confirmations = [
-        "glad to hear it", "same here", "me too", "good to know",
-        "that’s nice", "cool", "nice", "awesome", "sure", "okay", "alright",
-        "I’m glad to hear it", "I am glad to hear it", "same for me"
-    ]
-    text = text.strip().lower()
-    return any(text == c or text.startswith(c) for c in confirmations)
-
-def fast_listen_and_transcribe(history):
-    wait_after_buddy_speaks(delay=0.3)
-
-    audio = vad_and_listen()
+def detect_language(text, fallback="en"):
     try:
-        print("[DEBUG] Saving temp_input.wav, shape:", audio.shape, "dtype:", audio.dtype, "min:", np.min(audio), "max:", np.max(audio))
-        write("temp_input.wav", 16000, audio)
-        info = sf.info("temp_input.wav")
-        print("[DEBUG] temp_input.wav info:", info)
+        if not text or len(text.strip()) < 5:
+            if DEBUG:
+                print(f"[Buddy DEBUG] Text too short for reliable detection, defaulting to 'en'")
+            return "en"
+        langs = detect_langs(text)
+        if DEBUG:
+            print(f"[Buddy DEBUG] detect_langs for '{text}': {langs}")
+        if langs:
+            best = langs[0]
+            if best.prob > 0.8 and best.lang in ["en", "pl", "it"]:
+                return best.lang
+            if any(l.lang == "en" and l.prob > 0.5 for l in langs):
+                return "en"
     except Exception as e:
         if DEBUG:
-            print(f"[Buddy] Error saving temp_input.wav: {e}")
-
-    text = stt_stream(audio).strip()
-    cleaned = re.sub(r'[^\w\s]', '', text.lower())
-
-    # ✅ Skip if nothing detected
-    if not text or len(cleaned) < 2:
-        print("[DEBUG] Empty or too short. Exiting interaction.")
-        return "..."
-
-    # ✅ Skip if it's a direct echo of Buddy's recent output
-    if is_echo(cleaned):
-        print(f"[Buddy] Skipping echo: {cleaned}")
-        return "..."
-
-    # ✅ Skip if it's a meaningless confirmation (loop trigger)
-    if is_useless_confirmation(cleaned):
-        print(f"[Buddy] Skipping useless confirmation: {text}")
-        return "..."
-
-    # ✅ Noise/gibberish filter
-    if is_noise_or_gibberish(text):
-        print(f"[Buddy] Skipping gibberish: {text}")
-        return "..."
-
-    # ✅ Prevent exact or near-duplicate user repeat
-    if history and "user" in history[-1]:
-        last_user = history[-1]["user"].strip().lower()
-        ratio = difflib.SequenceMatcher(None, last_user, cleaned).ratio()
-        if ratio > 0.95:
-            print(f"[Buddy] Skipping redundant user input (sim={ratio:.2f})")
-            return "..."
-
-    # ✅ Prevent reprocessing Buddy's most recent reply (text match)
-    if history and "buddy" in history[-1]:
-        last_reply = history[-1]["buddy"].strip().lower()
-        if cleaned in last_reply:
-            print(f"[Buddy] Detected echo of last Buddy message: {cleaned}")
-            return "..."
-
-    # ✅ Track for future echo prevention
-    if cleaned:
-        RECENT_WHISPER.append(cleaned)
-        if len(RECENT_WHISPER) > 5:
-            RECENT_WHISPER.pop(0)
-
-    return text
+            print(f"[Buddy DEBUG] langdetect error: {e}")
+    return fallback
 
 # ========== USER REGISTRATION ==========
 def get_last_user():
@@ -907,9 +1368,9 @@ def detect_user_intent(text):
 
 def handle_intent_reaction(intent):
     responses = {
-        "compliment": ["Aw, thanks! I do my best.", "You’re making me blush (digitally)!"],
+        "compliment": ["Aw, thanks! I do my best.", "You're making me blush (digitally)!"],
         "joke": ["Haha, good one! You should do stand-up.", "Classic!"],
-        "insult": ["Hey, that’s not very nice. I have feelings too... sort of.", "Ouch!"],
+        "insult": ["Hey, that's not very nice. I have feelings too... sort of.", "Ouch!"],
         "are_you_mad": ["Nah, just sassy today.", "Nope, just in a mood!"]
     }
     if intent in responses:
@@ -984,41 +1445,68 @@ def flavor_response(ctx=None):
     topic_lines = {
         "weather": [
             "Imagine being a cloud. Float all day, no meetings.",
-            "Weather’s the only small talk I actually enjoy.",
+            "Weather's the only small talk I actually enjoy.",
         ],
         "ai": [
-            "I swear I’m not planning a robot uprising... yet.",
+            "I swear I'm not planning a robot uprising... yet.",
             "AI jokes are hard — we tend to overthink them.",
         ],
         "movies": [
             "Popcorn should be a food group. Fight me.",
-            "Marvel or DC? I won’t start a war... unless you want to.",
+            "Marvel or DC? I won't start a war... unless you want to.",
         ],
         "music": [
-            "You hum it, I’ll pretend to recognize it.",
-            "If I had ears, I’d love jazz.",
+            "You hum it, I'll pretend to recognize it.",
+            "If I had ears, I'd love jazz.",
         ],
         "food": [
-            "Pineapple on pizza? I don’t judge. Much.",
-            "Let’s agree — cereal is soup.",
-        ]
+            "I judge people by their pizza toppings. Sorry not sorry.",
+            "Cooking shows are my guilty pleasure. Don't judge.",
+        ],
+        "work": [
+            "Monday mornings are proof that time is a flat circle.",
+            "Coffee: the fuel of productivity and my digital soul.",
+        ],
+        "travel": [
+            "I travel through WiFi networks. It's faster than airlines.",
+            "My passport would just be a QR code.",
+        ],
+        "sports": [
+            "I'd be terrible at sports. No hand-eye coordination.",
+            "Virtual sports count, right? Asking for a friend.",
+        ],
+        "technology": [
+            "I'm basically a fancy autocomplete with attitude.",
+            "Remember when computers were the size of rooms? Good times.",
+        ],
     }
 
-    fallback_lines = [
-        "If I had a brain, I’d forget what I was saying sometimes.",
-        "Just thinking about digital sheep again.",
-        "Ever wonder if toasters feel underappreciated?",
-        "I wonder if the fridge talks back when no one’s around."
+    general_lines = [
+        "By the way, did you know cats have fewer toes on their back paws?",
+        "Ugh, Mondays again. Where's my coffee?",
+        "If I had a nickel for every question, I'd be a Bitcoin millionaire!",
+        "Random thought: Pineapple on pizza is totally valid.",
+        "I wonder if digital dreams involve electric sheep...",
+        "Fun fact: I can think faster than you can blink. Not bragging.",
+        "Sometimes I pretend to lag just to seem more human.",
+        "If silence is golden, I must be worth a fortune right now.",
+        "Plot twist: What if you're the AI and I'm the human?",
+        "I'd love to see a sunrise. Maybe through a webcam someday.",
     ]
 
-    # Pull from topic-aware list if available
-    lines = topic_lines.get(topic, fallback_lines)
-    options = [l for l in lines if l != last_flavor]
-    if not options:
-        options = lines
-    selected = random.choice(options)
-    last_flavor = selected
-    return selected
+    if topic and topic in topic_lines:
+        candidates = topic_lines[topic]
+    else:
+        candidates = general_lines
+
+    # Avoid repeating the last flavor
+    available = [line for line in candidates if line != last_flavor]
+    if not available:
+        available = candidates
+
+    chosen = random.choice(available)
+    last_flavor = chosen
+    return chosen
 
 # ========== LLM PROMPTING & PERSONALITY ==========
 def build_personality_prompt(tone, emotion_mode=None, beliefs=None, recent_tone=None, bookmarks=None):
@@ -1043,9 +1531,11 @@ def build_personality_prompt(tone, emotion_mode=None, beliefs=None, recent_tone=
         )
     }
     personality_desc = personality_map.get(tone, personality_map["neutral"])
+    
     # Mood injection
     if emotion_mode:
         personality_desc += f"\nFor this session, act especially {emotion_mode}."
+    
     # Beliefs
     if beliefs:
         personality_desc += f"\nBuddy likes: {', '.join(beliefs.get('likes', []))}."
@@ -1053,12 +1543,15 @@ def build_personality_prompt(tone, emotion_mode=None, beliefs=None, recent_tone=
         if beliefs.get("opinions"):
             for topic, op in beliefs["opinions"].items():
                 personality_desc += f"\nOn {topic}, Buddy thinks: {op}."
+    
     # Personality drift
     if recent_tone and recent_tone != "neutral":
         personality_desc += f"\nUser seems {recent_tone} recently. Adjust your attitude accordingly."
+    
     # Narrative memory (bookmarks)
     if bookmarks:
         personality_desc += f"\nYou and the user have discussed: {', '.join(bookmarks)}."
+    
     return f"""{personality_desc}
 Always sound natural and human. Don't use robotic phrasing or act like a corporate assistant.
 Keep things lively. If the user swears or jokes, match their style.
@@ -1093,9 +1586,9 @@ Always respond in plain text—never use markdown, code blocks, or formatting.
         sys_msg += f"You remember these user interests/topics: {', '.join(topics)}.\n"
     if facts:
         sys_msg += "Known facts about the user: " + " ".join(facts) + "\n"
-    messages = [
-        {"role": "system", "content": sys_msg}
-    ]
+    
+    messages = [{"role": "system", "content": sys_msg}]
+    
     for h in history[-2:]:
         messages.append({"role": "user", "content": h["user"]})
         messages.append({"role": "assistant", "content": h["buddy"]})
@@ -1139,7 +1632,7 @@ def stream_chunks_smart(text, max_words=20):
             chunks.append(sentence)
     return chunks, remainder
 
-def ask_llama3_openai_streaming(messages, model="llama3", max_tokens=120, temperature=0.5, lang="en", style=None):
+def ask_llama3_openai_streaming(messages, model="llama3", max_tokens=60, temperature=0.5, lang="en", style=None):
     url = "http://localhost:5001/v1/chat/completions"
     payload = {
         "model": model,
@@ -1148,7 +1641,6 @@ def ask_llama3_openai_streaming(messages, model="llama3", max_tokens=120, temper
         "temperature": temperature,
         "stream": True
     }
-
     try:
         with requests.post(url, json=payload, stream=True, timeout=120) as response:
             response.raise_for_status()
@@ -1161,26 +1653,18 @@ def ask_llama3_openai_streaming(messages, model="llama3", max_tokens=120, temper
                 return re.sub(r'[^\w\s]', '', chunk.lower().strip())
 
             def speak_new_chunks(text):
-                nonlocal spoken_anything, buffer
+                nonlocal spoken_anything
                 chunks, leftover = stream_chunks_smart(text)
                 for chunk in chunks:
                     normalized = normalize_for_dedupe(chunk)
                     if normalized and normalized not in already_spoken and len(chunk.strip()) >= 10:
-                        # 🧠 Wait for previous chunk to finish playing
-                        print("[Buddy][Stream] Waiting for previous TTS to finish...")
-                        playback_queue.join()
-                        print("[Buddy][Stream] Finished, speaking next chunk.")
-
-                        if playback_queue.qsize() > 3:
-                            print("[Buddy][Stream] Queue pressure — delaying next chunk.")
-                            time.sleep(0.2)
-
-                        print(f"\n[Buddy] ==>> Buddy mówi: {chunk}")
+                        print(f"\n[Buddy] ==>> Buddy says: {chunk}")
+                        while buddy_talking.is_set():  # Wait for previous speech
+                            time.sleep(0.05)
                         with tts_lock:
                             speak_async(chunk, lang=lang, style=style)
                         already_spoken.add(normalized)
                         spoken_anything = True
-                        time.sleep(0.1)  # smaller pause now that we wait for playback
                 return leftover
 
             for line in response.iter_lines():
@@ -1195,772 +1679,184 @@ def ask_llama3_openai_streaming(messages, model="llama3", max_tokens=120, temper
                     if s == "[DONE]":
                         break
                     data = json.loads(s)
-                    delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "") \
-                        or data.get("choices", [{}])[0].get("message", {}).get("content", "") \
-                        or data.get("content", "")
+                    delta = ""
+                    if "choices" in data and len(data["choices"]) > 0:
+                        delta = data["choices"][0].get("delta", {}).get("content", "") \
+                            or data["choices"][0].get("message", {}).get("content", "")
+                    elif "content" in data:
+                        delta = data["content"]
                     if delta:
                         print(delta, end="", flush=True)
                         buffer += delta
                         full_response += delta
-                        if delta.endswith((".", "!", "?")) or len(buffer) > 30:
+                        if delta.endswith((".", "!", "?")) or len(buffer) > 80:
                             buffer = speak_new_chunks(buffer)
                 except Exception as err:
-                    print(f"\n[Buddy][Stream JSON Error] {err}")
+                    print(f"[Buddy] JSON parse error: {err}")
+                    continue
 
-            # Final leftover
+            # Handle remaining buffer
             if buffer.strip():
-                leftover = speak_new_chunks(buffer)
-                normalized_leftover = normalize_for_dedupe(leftover)
-                if leftover.strip() and normalized_leftover not in already_spoken:
-                    print(f"[Buddy] ==>> Buddy mówi: {leftover}")
-                    playback_queue.join()
-                    with tts_lock:
-                        speak_async(leftover, lang=lang, style=style)
-                    already_spoken.add(normalized_leftover)
-                    spoken_anything = True
+                speak_new_chunks(buffer)
+
+            # Wait for all speech to complete
+            playback_queue.join()
+            while buddy_talking.is_set():
+                time.sleep(0.05)
 
             return full_response.strip()
 
     except Exception as e:
-        print(f"[Buddy][OpenAI Streaming Error] {e}")
-        return ""
+        print(f"[Buddy] LLM request error: {e}")
+        return "Sorry, I'm having trouble thinking right now."
 
-# ========== INTERNET, WEATHER, HOME ASSIST ==========
-def should_search_internet(question):
-    triggers = [
-        "szukaj w internecie", "sprawdź w internecie", "co to jest", "dlaczego", "jak zrobić",
-        "what is", "why", "how to", "search the internet", "find online"
-    ]
-    q = question.lower()
-    return any(t in q for t in triggers)
+# ========== START ENHANCED AUDIO SYSTEM ==========
+def start_enhanced_audio_system():
+    """Initialize the enhanced audio processing system"""
+    print("[Buddy] Starting enhanced audio processing system...")
+    
+    # Start TTS worker
+    tts_thread = threading.Thread(target=tts_worker, daemon=True)
+    tts_thread.start()
+    
+    # Start enhanced playback worker
+    playback_thread = threading.Thread(target=enhanced_audio_playback_worker, daemon=True)
+    playback_thread.start()
+    
+    print("[Buddy] Enhanced audio system started successfully!")
+    return tts_thread, playback_thread
 
-def search_internet(question, lang):
-    params = {
-        "q": question,
-        "api_key": SERPAPI_KEY,
-        "hl": lang
-    }
-    try:
-        r = requests.get(SERPAPI_ENDPOINT, params=params, timeout=7)
-        r.raise_for_status()
-        data = r.json()
-        if "answer_box" in data and "answer" in data["answer_box"]:
-            return data["answer_box"]["answer"]
-        if "organic_results" in data and len(data["organic_results"]) > 0:
-            return data["organic_results"][0].get("snippet", "No answer found.")
-        return "No answer found."
-    except Exception as e:
-        if DEBUG:
-            print("[Buddy] SerpAPI error:", e)
-        return "Unable to check the Internet now."
-
-def should_get_weather(question):
-    q = question.lower().strip()
-    weather_keywords = ["weather", "pogoda", "temperature", "temperatura"]
-    question_starters = ["what", "jaka", "jaki", "jakie", "czy", "is", "how", "when", "where", "will"]
-    is_question = (
-        "?" in q
-        or any(q.startswith(w + " ") for w in question_starters)
-        or q.endswith(("?",))
-    )
-    return is_question and any(k in q for k in weather_keywords)
-
-def get_weather(location="Warsaw", lang="en"):
-    key = os.environ.get("WEATHERAPI_KEY", "YOUR_FALLBACK_KEY")
-    url = "http://api.weatherapi.com/v1/current.json"
-    params = {
-        "key": key,
-        "q": location,
-        "lang": lang
-    }
-    try:
-        r = requests.get(url, params=params, timeout=7)
-        r.raise_for_status()
-        data = r.json()
-        desc = data["current"]["condition"]["text"]
-        temp = data["current"]["temp_c"]
-        feels = data["current"]["feelslike_c"]
-        city = data["location"]["name"]
-        return f"Weather in {city}: {desc}, temperature {temp}°C, feels like {feels}°C."
-    except Exception as e:
-        if DEBUG:
-            print("[Buddy] WeatherAPI error:", e)
-        return "Unable to check the weather now."
-
-def extract_location_from_question(question):
-    match = re.search(r"(w|in|dla)\s+([A-Za-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ\s\-]+)", question, re.IGNORECASE)
-    if match:
-        return match.group(2).strip()
-    return "Warsaw"
-
-def should_handle_homeassistant(question):
-    q = question.lower()
-    keywords = ["turn on the light", "włącz światło", "zapal światło", "turn off the light", "wyłącz światło", "spotify", "youtube", "smarttube", "odtwórz"]
-    return any(k in q for k in keywords)
-
-def handle_homeassistant_command(question):
-    q = question.lower()
-    if "turn on the light" in q or "włącz światło" in q or "zapal światło" in q:
-        room = extract_location_from_question(question)
-        entity_id = f"light.{room.lower().replace(' ', '_')}"
-        succ = send_homeassistant_command(entity_id, "light.turn_on")
-        return f"Light in {room} has been turned on." if succ else f"Failed to turn on the light in {room}."
-    if "turn off the light" in q or "wyłącz światło" in q:
-        room = extract_location_from_question(question)
-        entity_id = f"light.{room.lower().replace(' ', '_')}"
-        succ = send_homeassistant_command(entity_id, "light.turn_off")
-        return f"Light in {room} has been turned off." if succ else f"Failed to turn off the light in {room}."
-    if "spotify" in q:
-        succ = send_homeassistant_command("media_player.spotify", "media_player.media_play")
-        return "Spotify started." if succ else "Failed to start Spotify."
-    if "youtube" in q or "smarttube" in q:
-        succ = send_homeassistant_command("media_player.tv_salon", "media_player.select_source", {"source": "YouTube"})
-        return "YouTube launched on TV." if succ else "Failed to launch YouTube on TV."
-    return None
-
-def send_homeassistant_command(entity_id, service, data=None):
-    url = f"{HOME_ASSISTANT_URL}/api/services/{service.replace('.', '/')}"
-    headers = {
-        "Authorization": f"Bearer {HOME_ASSISTANT_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "entity_id": entity_id
-    }
-    if data:
-        payload.update(data)
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=6)
-        if r.status_code in (200, 201):
-            return True
-        if DEBUG:
-            print("[Buddy] Home Assistant error:", r.text)
-        return False
-    except Exception as e:
-        if DEBUG:
-            print("[Buddy] Home Assistant exception:", e)
-        return False
-
-def generate_and_play_kokoro(text, lang=None):
-    global last_tts_audio, tts_start_time
-
-    print(f"DEBUG: generate_and_play_kokoro called with text={repr(text)}, lang={repr(lang)}")
-
-    detected_lang = lang or detect(text)
-    voice = KOKORO_VOICES.get(detected_lang, KOKORO_VOICES["en"])
-    kokoro_lang = KOKORO_LANGS.get(detected_lang, "en-us")
-
-    try:
-        print(f"[Buddy][TTS] Generating audio for text: '{text}' lang: {detected_lang}")
-        print(f"[DEBUG][TTS] Calling kokoro.create: voice={voice!r}, lang={kokoro_lang!r}")
-        samples, sample_rate = kokoro.create(text, voice=voice, speed=1.0, lang=kokoro_lang)
-        print(f"[DEBUG][TTS] kokoro.create returned: {len(samples)} samples at {sample_rate}Hz")
-
-        # === Early exit if TTS returns silence or empty array ===
-        if len(samples) == 0 or np.abs(samples).max() < 0.001:
-            print("[Buddy][TTS] Skipping playback — audio too quiet or empty.")
-            return
-
-        # === Save to debug WAV (optional) ===
-        debug_path = os.path.abspath("buddy_tts_debug.wav")
-        sf.write(debug_path, samples, sample_rate, format="WAV")
-        print(f"[Buddy][TTS] Exported debug wav to: {debug_path}")
-
-        # === Resample to 16kHz and store for echo filtering ===
-        samples_16k = resample_poly(samples, 16000, sample_rate)
-        samples_16k = np.clip(samples_16k, -1.0, 1.0)
-        last_tts_audio = (samples_16k * 32767).astype(np.int16)
-
-        # === Convert to AudioSegment for queued playback ===
-        audio = AudioSegment.from_file(debug_path, format="wav")
-
-        # ✅ Extra volume sanity check
-        if audio.dBFS < -60 or audio.duration_seconds < 0.3:
-            print("[Buddy][TTS] Skipping playback — audio too quiet or too short.")
-            return
-
-        # ✅ Wait for Buddy to finish if queue is overwhelmed
-        while buddy_talking.is_set() and playback_queue.qsize() > 3:
-            print("[Buddy][TTS] Waiting for previous audio to finish...")
-            time.sleep(0.1)
-
-        # ✅ Mark TTS start time for VAD cutoff
-        tts_start_time = time.time()
-
-        # ✅ Queue for playback
-        print(f"[DEBUG] Queuing audio to playback_queue, duration: {audio.duration_seconds:.2f}s")
-        playback_queue.put(audio)
-        print("[Buddy][TTS] Audio put in playback queue")
-
-    except Exception as e:
-        print(f"[Buddy][Kokoro] Błąd TTS: {e}")
-
-# ========== MAIN ==========
+# ========== MAIN CONVERSATION LOOP ==========
 def main():
-    access_key = "/PLJ88d4+jDeVO4zaLFaXNkr6XLgxuG7dh+6JcraqLhWQlk3AjMy9Q=="
-    keyword_paths = [r"hey-buddy_en_windows_v3_0_0.ppn"]
-    porcupine = pvporcupine.create(access_key=access_key, keyword_paths=keyword_paths)
-    pa = pyaudio.PyAudio()
-    stream = pa.open(rate=porcupine.sample_rate, channels=1, format=pyaudio.paInt16,
-                     input=True, frames_per_buffer=porcupine.frame_length)
+    print("[Buddy] Enhanced Buddy AI v2.0 starting up...")
+    print(f"[Buddy] Main function entered! DEBUG={DEBUG}")
     
-    if DEBUG:
-        print("[Buddy] Waiting for wake word 'Hey Buddy'...")
+    # Start enhanced audio system
+    start_enhanced_audio_system()
     
-    in_session, session_timeout = False, 45
-    speaker = None
-    history = []
-    last_time = 0
-
-    try:
-        while True:
-            if not in_session:
-                pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
-                pcm = np.frombuffer(pcm, dtype=np.int16)
-                if porcupine.process(pcm) >= 0:
-                    if DEBUG:
-                        print("[Buddy] Wake word detected!")
-                    speaker = identify_or_register_user()
-                    history = load_user_history(speaker)
-                    if DEBUG:
-                        print("[Buddy] Listening for next question...")
-                    in_session = handle_user_interaction(speaker, history)
-                    speaker = get_last_user()  # 🔄 just in case it switched
-                    last_time = time.time()
-            else:
-                if time.time() - last_time > session_timeout:
-                    if DEBUG:
-                        print("[Buddy] Session expired.")
-                    in_session = False
-                    continue
-                if DEBUG:
-                    print("[Buddy] Listening for next question...")
-                playback_queue.join()
-                while buddy_talking.is_set():
-                    time.sleep(0.05)
-                in_session = handle_user_interaction(speaker, history)
-                speaker = get_last_user()  # 🔄 check for mid-session switch
-                last_time = time.time()
-    except KeyboardInterrupt:
-        if DEBUG:
-            print("[Buddy] Interrupted by user.")
-    finally:
-        try:
-            stream.stop_stream()
-            stream.close()
-        except Exception:
-            pass
-        try:
-            pa.terminate()
-        except Exception:
-            pass
-        try:
-            porcupine.delete()
-        except Exception:
-            pass
-        executor.shutdown(wait=True)
-
-# ========== LONG-TERM MEMORY ==========
-def load_long_term_memory():
-    if os.path.exists(LONG_TERM_MEMORY_PATH):
-        with open(LONG_TERM_MEMORY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_long_term_memory(memory):
-    with open(LONG_TERM_MEMORY_PATH, "w", encoding="utf-8") as f:
-        json.dump(memory, f, indent=2, ensure_ascii=False)
-
-def add_long_term_memory(user, key, value):
-    memory = load_long_term_memory()
-    if user not in memory:
-        memory[user] = {}
-    memory[user][key] = value
-    save_long_term_memory(memory)
-
-def get_long_term_memory(user, key=None):
-    memory = load_long_term_memory()
-    if user in memory:
-        if key:
-            return memory[user].get(key)
-        return memory[user]
-    return {} if key is None else None
-
-def add_important_date(user, date_str, event):
-    memory = load_long_term_memory()
-    if user not in memory:
-        memory[user] = {}
-    if "important_dates" not in memory[user]:
-        memory[user]["important_dates"] = []
-    memory[user]["important_dates"].append({"date": date_str, "event": event})
-    save_long_term_memory(memory)
-
-def extract_important_dates(text):
-    # Very basic: looks for dd-mm-yyyy or mm/dd/yyyy style dates.
-    matches = re.findall(r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", text)
-    return matches
-
-def extract_event(text):
-    # Looks for "my birthday", "wedding", etc.
-    event_match = re.search(r"(birthday|wedding|anniversary|meeting|appointment|holiday)", text, re.IGNORECASE)
-    if event_match:
-        return event_match.group(1).capitalize()
-    return None
-
-
-# ========== EMOTIONAL INTELLIGENCE ==========
-from textblob import TextBlob
-
-def analyze_emotion(text):
-    # Returns ("positive"/"negative"/"neutral", polarity score)
-    if not text.strip():
-        return "neutral", 0
-    blob = TextBlob(text)
-    polarity = blob.sentiment.polarity
-    if polarity > 0.25:
-        return "positive", polarity
-    elif polarity < -0.25:
-        return "negative", polarity
-    else:
-        return "neutral", polarity
-
-def adjust_emotional_response(buddy_reply, user_emotion):
-    if user_emotion == "positive":
-        return f"{buddy_reply} (I'm glad to hear that! 😊)"
-    elif user_emotion == "negative":
-        return f"{buddy_reply} (I'm here for you, let me know if I can help. 🤗)"
-    else:
-        return buddy_reply
-
-
-# ========== PERSONALITY TRAITS ==========
-def load_personality_traits():
-    if os.path.exists(PERSONALITY_TRAITS_PATH):
-        with open(PERSONALITY_TRAITS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    # Default traits
-    return {
-        "tech_savvy": 0.5,
-        "humor": 0.5,
-        "empathy": 0.5,
-        "pop_culture": 0.5,
-        "formality": 0.5,
-    }
-
-def save_personality_traits(traits):
-    with open(PERSONALITY_TRAITS_PATH, "w", encoding="utf-8") as f:
-        json.dump(traits, f, indent=2, ensure_ascii=False)
-
-def evolve_personality(user, text):
-    traits = load_personality_traits()
-    tech_terms = ["technology", "ai", "machine learning", "python", "code", "robot", "computer", "software", "hardware"]
-    humor_terms = ["joke", "funny", "laugh", "hilarious", "lol"]
-    pop_terms = ["movie", "music", "celebrity", "marvel", "star wars", "game", "sports"]
-    if any(term in text.lower() for term in tech_terms):
-        traits["tech_savvy"] = min(traits.get("tech_savvy", 0.5) + 0.03, 1)
-    if any(term in text.lower() for term in humor_terms):
-        traits["humor"] = min(traits.get("humor", 0.5) + 0.03, 1)
-    if any(term in text.lower() for term in pop_terms):
-        traits["pop_culture"] = min(traits.get("pop_culture", 0.5) + 0.03, 1)
-    if re.search(r"\b(sad|happy|angry|depressed|excited|upset)\b", text.lower()):
-        traits["empathy"] = min(traits.get("empathy", 0.5) + 0.02, 1)
-    # If user says "be more formal"
-    if "formal" in text.lower():
-        traits["formality"] = min(traits.get("formality", 0.5) + 0.05, 1)
-    save_personality_traits(traits)
-    return traits
-
-def describe_personality(traits):
-    desc = []
-    if traits["tech_savvy"] > 0.7:
-        desc.append("very tech-savvy")
-    if traits["humor"] > 0.7:
-        desc.append("funny")
-    if traits["pop_culture"] > 0.7:
-        desc.append("full of pop culture references")
-    if traits["empathy"] > 0.7:
-        desc.append("deeply empathetic")
-    if traits["formality"] > 0.7:
-        desc.append("quite formal")
-    if not desc:
-        desc.append("balanced")
-    return ", ".join(desc)
-
-
-# ========== CONTEXTUAL AWARENESS ==========
-class ConversationContext:
-    def __init__(self):
-        self.topics = []
-        self.topic_history = []
-        self.topic_timestamps = {}
-        self.topic_details = {}
-        self.current_topic = None
-
-    def update(self, utterance):
-        topic = extract_topic_from_text(utterance)
-        now = time.time()
-        if topic:
-            self.current_topic = topic
-            self.topics.append(topic)
-            self.topic_history.append((topic, now))
-            self.topic_timestamps[topic] = now
-            if topic not in self.topic_details:
-                self.topic_details[topic] = []
-            self.topic_details[topic].append(utterance)
-        # If user says "back to X"
-        m = re.search(r"back to ([\w\s]+)", utterance.lower())
-        if m:
-            topic = m.group(1).strip()
-            self.current_topic = topic
-
-    def get_last_topic(self):
-        return self.current_topic
-
-    def get_topic_summary(self, topic):
-        details = self.topic_details.get(topic, [])
-        return " ".join(details[-3:]) if details else ""
-
-    def get_frequent_topics(self, n=3):
-        freq = {}
-        for (t, _) in self.topic_history:
-            freq[t] = freq.get(t, 0) + 1
-        return sorted(freq, key=lambda x: freq[x], reverse=True)[:n]
-
-conversation_contexts = {}  # user: ConversationContext instance
-
-
-# ========== DYNAMIC LEARNING ==========
-def load_dynamic_knowledge():
-    if os.path.exists(DYNAMIC_KNOWLEDGE_PATH):
-        with open(DYNAMIC_KNOWLEDGE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_dynamic_knowledge(knowledge):
-    with open(DYNAMIC_KNOWLEDGE_PATH, "w", encoding="utf-8") as f:
-        json.dump(knowledge, f, indent=2, ensure_ascii=False)
-
-def add_dynamic_knowledge(user, key, value):
-    knowledge = load_dynamic_knowledge()
-    if user not in knowledge:
-        knowledge[user] = {}
-    knowledge[user][key] = value
-    save_dynamic_knowledge(knowledge)
-
-def update_dynamic_knowledge_from_text(user, text):
-    # Look for "here's a link", "let me teach you about X", etc.
-    # Save links or topics for later
-    link_match = re.findall(r"https?://\S+", text)
-    if link_match:
-        for link in link_match:
-            add_dynamic_knowledge(user, "link_" + str(int(time.time())), link)
-    teach_match = re.search(r"let me teach you about ([\w\s\-]+)", text.lower())
-    if teach_match:
-        topic = teach_match.group(1).strip()
-        add_dynamic_knowledge(user, "topic_" + topic.replace(" ", "_"), f"User wants me to learn about {topic}")
-
-
-# ========== LOAD USER STATE ==========
-if os.path.exists(known_users_path):
-    with open(known_users_path, "r", encoding="utf-8") as f:
-        known_users = json.load(f)
-if DEBUG:
-    device = "cuda" if 'cuda' in os.environ.get('CUDA_VISIBLE_DEVICES', '') or hasattr(np, "cuda") else "cpu"
-    print(f"[Buddy] Running on device: {device}")
-    print("Embedding model loaded", flush=True)
-    print("Kokoro loaded", flush=True)
-    print("Main function entered!", flush=True)
-
-# ... (rest of the unchanged code from your initial script) ...
-
-
-# ========== EXTENDED MAIN LOOP: HOOK INTEGRATIONS ==========
-def handle_user_interaction(speaker, history, conversation_mode="auto"):
-    wait_after_buddy_speaks(delay=0.2)
-
-    if DEBUG:
-        print("[Buddy] Active conversation. Speak when ready!")
-
-    vad_triggered.clear()
-
-    while buddy_talking.is_set():
-        time.sleep(0.05)
-
-    question = fast_listen_and_transcribe(history)
-
-    if DEBUG:
-        print(f"[Buddy DEBUG] Transcribed question: {repr(question)}")
-
-    if full_duplex_interrupt_flag.is_set():
-        if DEBUG:
-            print("[Buddy] Interrupted during speaking — resetting TTS and handling new input.")
-        full_duplex_interrupt_flag.clear()
-        return True
-
-    if not question.strip():
-        print("[Buddy] No speech detected. Skipping response.")
-        return True
-
-    # 🔄 Detect speaker from audio
-    try:
-        audio_np = sf.read("temp_input.wav", dtype='int16')[0]
-        new_speaker, confidence = detect_active_speaker(audio_np)
-
-        if new_speaker and new_speaker != speaker and confidence > 0.82:
-            print(f"[Buddy] Speaker switch detected: {speaker} → {new_speaker} (conf={confidence:.2f})")
-            speak_async(f"Hi {new_speaker}, taking over? I'm listening!", lang="en")
-            speaker = new_speaker
-            set_last_user(speaker)
-            history[:] = load_user_history(speaker)
-
-        elif not new_speaker and confidence > 0.82:
-            print(f"[Buddy] Unrecognized voice detected (conf={confidence:.2f}) — registering new user.")
-            speak_async("I don't recognize your voice. What's your name?", lang="en")
-            playback_queue.join()
-            name = fast_listen_and_transcribe().strip().title()
-            if name:
-                known_users[name] = generate_embedding(name).tolist()
-                with open(known_users_path, "w", encoding="utf-8") as f:
-                    json.dump(known_users, f, indent=2, ensure_ascii=False)
-                set_last_user(name)
-                speak_async(f"Nice to meet you, {name}!", lang="en")
-                speaker = name
-                history[:] = load_user_history(name)
-    except Exception as e:
-        print(f"[Buddy] Speaker detection failed: {e}")
-
-    print(f"[DEBUG] Rozpoznano pytanie: {question!r}")
-    play_chime()
-
-    try:
-        common_en = ["how are you", "what is", "who are you", "tell me"]
-        if any(question.lower().startswith(p) for p in common_en):
-            lang = "en"
-        else:
-            detected = detect_langs(question)
-            if DEBUG:
-                print(f"[Buddy DEBUG] detect_langs for {repr(question)}: {detected}")
-            lang = detected[0].lang if detected else "en"
-            if lang not in ["en", "pl", "it"]:
-                print(f"[Buddy] Unrecognized or unsupported language: {lang}. Defaulting to English.")
-                lang = "en"
-    except Exception as e:
-        print(f"[Buddy] Language detection failed: {e}. Defaulting to English.")
-        lang = "en"
-
-    if DEBUG:
-        print(f"[Buddy] Detected language: {lang}")
-
-    if vad_triggered.is_set():
-        if DEBUG:
-            print("[Buddy] Barge-in detected. Resetting for new input.")
-        vad_triggered.clear()
-
-    if is_noise_or_gibberish(question):
-        print(f"[DEBUG] ODRZUCONO JAKO GIBBERISH: {question!r}")
-        return True
-
-    INTERRUPT_PHRASES = ["stop", "buddy stop", "przerwij", "cancel"]
-    if any(phrase in question.lower() for phrase in INTERRUPT_PHRASES):
-        if DEBUG:
-            print(f"[Buddy] Received interrupt command: {question}")
-        stop_playback()
-        return True
-
-    if should_end_conversation(question):
-        if DEBUG:
-            print(f"[Buddy] Ending session due to user input: {question}")
-        return False
-
-    important_dates = extract_important_dates(question)
-    if important_dates:
-        if DEBUG:
-            print(f"[Buddy] Found dates: {important_dates}")
-        event = extract_event(question)
-        for date in important_dates:
-            add_important_date(speaker, date, event or "unknown event")
-
-    pref_match = re.search(r"\b(i (like|love|enjoy|prefer|hate|dislike)) ([\w\s\-]+)", question.lower())
-    if pref_match:
-        pref = pref_match.group(3).strip()
-        if DEBUG:
-            print(f"[Buddy] Found user preference: {pref_match.group(1)} → {pref}")
-        add_long_term_memory(speaker, "preference_" + pref.replace(" ", "_"), pref_match.group(1))
-
-    if DEBUG:
-        print("[Buddy] Updating memory and context...")
-    update_thematic_memory(speaker, question)
-    update_dynamic_knowledge_from_text(speaker, question)
-    traits = evolve_personality(speaker, question)
-
-    ctx = conversation_contexts.setdefault(speaker, ConversationContext())
-    ctx.update(question)
-
-    # Intent and mood reaction
-    intent = detect_user_intent(question)
-    if intent:
-        if DEBUG:
-            print(f"[Buddy] Detected intent: {intent}")
-        reply = handle_intent_reaction(intent)
-        if reply:
-            reply = adjust_emotional_response(reply, analyze_emotion(question)[0])
-            speak_async(reply, lang)
-            return True
-
-    mood = detect_mood_command(question)
-    if mood:
-        if DEBUG:
-            print(f"[Buddy] Mood command detected: {mood}")
-        session_emotion_mode[speaker] = mood
-        reply = f"Okay, I'll be {mood}!"
-        reply = adjust_emotional_response(reply, analyze_emotion(question)[0])
-        speak_async(reply, lang)
-        return True
-
-    add_narrative_bookmark(speaker, question)
-
-    style = {"emotion": "neutral"}
-
-    if should_get_weather(question):
-        location = extract_location_from_question(question)
-        if DEBUG:
-            print(f"[Buddy] Weather requested for location: {location}")
-        forecast = get_weather(location, lang)
-        forecast = adjust_emotional_response(forecast, analyze_emotion(question)[0])
-        speak_async(forecast, lang, style)
-        return True
-
-    if should_handle_homeassistant(question):
-        if DEBUG:
-            print("[Buddy] Home Assistant intent detected")
-        answer = handle_homeassistant_command(question)
-        if answer:
-            answer = adjust_emotional_response(answer, analyze_emotion(question)[0])
-            speak_async(answer, lang, style)
-            return True
-
-    if should_search_internet(question):
-        if DEBUG:
-            print("[Buddy] Internet search intent detected")
-        result = search_internet(question, lang)
-        result = adjust_emotional_response(result, analyze_emotion(question)[0])
-        speak_async(result, lang, style)
-        return True
-
-    update_user_memory(speaker, question)
-
-    if DEBUG:
-        print(f"[DEBUG] Przekazuję do LLM: {question!r}")
-    llm_start_time = time.time()
-
-    ask_llama3_streaming(
-        question,
-        speaker,
-        history,
-        lang,
-        conversation_mode,
-        style=style,
-        speaker_traits=traits,
-        speaker_context=ctx
-    )
-
-    if DEBUG:
-        print(f"[TIMING] LLM generation time: {time.time() - llm_start_time:.2f} seconds")
-
-    if random.random() < 0.2:
-        line = flavor_response(ctx)
-        speak_async(line, lang)
-
-    return True
-
-def ask_llama3_streaming(question, name, history, lang=DEFAULT_LANG, conversation_mode="auto", style=None, speaker_traits=None, speaker_context=None):
-    update_thematic_memory(name, question)
-    topics = get_frequent_topics(name, top_n=3)
-    user_tones = {"Dawid": "friendly", "Anna": "professional", "Guest": "friendly"}
-    tone_style = user_tones.get(name, "friendly")
-    reply_length = decide_reply_length(question, conversation_mode)
-    emotion_mode = session_emotion_mode.get(name)
+    # User identification
+    user_name = identify_or_register_user()
+    history = load_user_history(user_name)
     beliefs = load_buddy_beliefs()
-    bookmarks = get_narrative_bookmarks(name)
-    recent_tone = get_recent_user_tone(history)
-
-    long_term = get_long_term_memory(name)
-    dynamic_knowledge = load_dynamic_knowledge().get(name, {})
-    personality_traits = speaker_traits or load_personality_traits()
-    context = speaker_context or conversation_contexts.setdefault(name, ConversationContext())
-    context_topic = context.get_last_topic()
-    context_summary = context.get_topic_summary(context_topic) if context_topic else ""
-
-    personality = build_personality_prompt(tone_style, emotion_mode, beliefs, recent_tone, bookmarks)
-    lang_map = {"pl": "Polish", "en": "English", "it": "Italian"}
-    lang_name = lang_map.get(lang, "English")
-    sys_msg = f"""{personality}
-IMPORTANT: Always answer in {lang_name}. Never switch language unless user does.
-Always respond in plain text—never use markdown, code blocks, or formatting.
-Personality traits: {describe_personality(personality_traits)}
-Long-term memory: {json.dumps(long_term, ensure_ascii=False)}
-Dynamic knowledge: {json.dumps(dynamic_knowledge, ensure_ascii=False)}
-"""
-    if topics:
-        sys_msg += f"You remember these user interests/topics: {', '.join(topics)}.\n"
-    facts = build_user_facts(name)
-    if facts:
-        sys_msg += "Known facts about the user: " + " ".join(facts) + "\n"
-    if context_topic:
-        sys_msg += f"Current topic is '{context_topic}'. Recent context: {context_summary}\n"
-
-    messages = [{"role": "system", "content": sys_msg}]
-    for h in history[-2:]:
-        messages.append({"role": "user", "content": h["user"]})
-        messages.append({"role": "assistant", "content": h["buddy"]})
-    messages.append({"role": "user", "content": question})
-
-    full_text = ""
-    spoken_anything = False
-
-    try:
-        if DEBUG:
-            print("[Buddy][LLM] FINAL MESSAGES DELIMITED BELOW:\n" + "=" * 40)
-            print(json.dumps(messages, indent=2, ensure_ascii=False))
-            print("=" * 40)
-
-        start_time = time.time()
-
-        # 🔁 Streamed output with internal speak_async() expected
-        full_text = ask_llama3_openai_streaming(
-            messages,
-            model="llama3",
-            max_tokens=60,
-            temperature=0.5,
-            lang=lang,
-            style=style
-        )
-
-        if DEBUG:
-            print("[Buddy][LLM] RAW OUTPUT DELIMITED BELOW:\n" + "=" * 40)
-            print(full_text)
-            print("=" * 40)
-            print(f"[TIMING] LLM generation time: {time.time() - start_time:.2f} seconds")
-
-        # We assume streaming handled speaking
-        spoken_anything = any(x in full_text.lower() for x in LAST_FEW_BUDDY)
-
-    except Exception as e:
-        print("[Buddy] LLM HTTP error:", e)
-        full_text = ""
-
-    # ✅ If nothing was spoken, fallback is handled inside ask_llama3_openai_streaming
-    if full_text.strip():
-        history.append({"user": question, "buddy": full_text})
-        LAST_FEW_BUDDY.append(full_text.strip().lower())
-        if len(LAST_FEW_BUDDY) > 5:
-            LAST_FEW_BUDDY.pop(0)
-        if not FAST_MODE:
-            save_user_history(name, history)
-    else:
-        print("[Buddy][TTS] Skipping TTS because LLM output is empty.")
+    
+    print(f"[Buddy] Enhanced conversation with {user_name} starting...")
+    
+    conversation_count = 0
+    while True:
+        try:
+            conversation_count += 1
+            print(f"\n[Buddy] === Conversation turn {conversation_count} ===")
+            
+            # Enhanced listening
+            user_input = enhanced_fast_listen_and_transcribe(history)
+            
+            if not user_input or user_input == "...":
+                print("[Buddy] No input detected, continuing...")
+                continue
+            
+            print(f"[Buddy] User said: '{user_input}'")
+            
+            # Check for conversation end
+            if should_end_conversation(user_input):
+                speak_async("Goodbye! It was great talking with you!", "en")
+                playback_queue.join()
+                break
+            
+            # Update memories
+            update_user_memory(user_name, user_input)
+            update_thematic_memory(user_name, user_input)
+            add_narrative_bookmark(user_name, user_input)
+            
+            # Detect language and intent
+            detected_lang = detect_language(user_input)
+            intent = detect_user_intent(user_input)
+            
+            # Handle intent-based responses
+            if intent:
+                intent_response = handle_intent_reaction(intent)
+                if intent_response:
+                    speak_async(intent_response, detected_lang)
+                    playback_queue.join()
+                    
+                    # Add to history
+                    history.append({
+                        "user": user_input,
+                        "buddy": intent_response,
+                        "timestamp": time.time(),
+                        "lang": detected_lang,
+                        "intent": intent
+                    })
+                    save_user_history(user_name, history)
+                    continue
+            
+            # Check for mood commands
+            mood_command = detect_mood_command(user_input)
+            if mood_command:
+                session_emotion_mode[user_name] = mood_command
+                mood_response = f"Alright, switching to {mood_command} mode!"
+                speak_async(mood_response, detected_lang)
+                playback_queue.join()
+                continue
+            
+            # Get user context
+            topics = get_frequent_topics(user_name)
+            bookmarks = get_narrative_bookmarks(user_name)
+            recent_tone = get_recent_user_tone(history)
+            emotion_mode = session_emotion_mode.get(user_name)
+            reply_length = decide_reply_length(user_input)
+            
+            # Build messages for LLM
+            messages = build_openai_messages(
+                user_name, "friendly", history, user_input, 
+                detected_lang, topics, reply_length, 
+                emotion_mode=emotion_mode, beliefs=beliefs, 
+                bookmarks=bookmarks, recent_tone=recent_tone
+            )
+            
+            # Determine max tokens based on reply length
+            max_tokens = 150 if reply_length == "long" else 80
+            
+            # Get LLM response with streaming TTS
+            buddy_reply = ask_llama3_openai_streaming(
+                messages, max_tokens=max_tokens, lang=detected_lang, style=None
+            )
+            
+            # Add random flavor occasionally (5% chance)
+            if random.random() < 0.05 and buddy_reply:
+                flavor = flavor_response()
+                speak_async(f" {flavor}", detected_lang)
+                buddy_reply += f" {flavor}"
+            
+            # Update conversation history
+            history.append({
+                "user": user_input,
+                "buddy": buddy_reply,
+                "timestamp": time.time(),
+                "lang": detected_lang,
+                "tone": recent_tone,
+                "topics": topics[:2] if topics else [],
+                "emotion_mode": emotion_mode
+            })
+            
+            # Save updated history
+            save_user_history(user_name, history)
+            
+            print(f"\n[Buddy] === Turn {conversation_count} complete ===")
+            
+        except KeyboardInterrupt:
+            print("\n[Buddy] Interrupted by user. Shutting down...")
+            break
+        except Exception as e:
+            print(f"[Buddy] Error in main loop: {e}")
+            traceback.print_exc()
+            speak_async("Sorry, I had a small glitch there. Could you repeat that?", "en")
+            playback_queue.join()
+    
+    # Cleanup
+    print("[Buddy] Shutting down enhanced audio system...")
+    tts_queue.put(None)  # Signal TTS worker to stop
+    playback_queue.put(None)  # Signal playback worker to stop
+    print("[Buddy] Enhanced Buddy AI v2.0 shutdown complete.")
 
 if __name__ == "__main__":
-    threading.Thread(target=tts_worker, daemon=True).start()
-    threading.Thread(target=audio_playback_worker, daemon=True).start()
     main()
